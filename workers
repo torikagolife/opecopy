@@ -1,0 +1,4545 @@
+// ============================================================
+// 📋 オペコピ (opecopy) — 対象用紙マスタ管理
+//   https://opecopy.toriweb.workers.dev/
+//
+// [画面]
+//   GET  /            … オペコピ本体(記録PDF→JOANR入力補助)
+//   GET  /admin       … 対象用紙マスタ管理画面
+//
+// [API]
+//   GET  /api/masters        … マスタ一覧
+//   GET  /api/master?id=xxx  … マスタ1件取得
+//   POST /api/master         … マスタ保存(新規/上書き)
+//   POST /api/master/delete  … マスタ削除
+//   POST /api/extract        … 記録面画像 + マスタ → 各項目の値をJSON抽出
+//   POST /api/label          … シール面画像 → 材料ラベル情報を抽出
+//   POST /api/kcode          … 術式名 → 登録術式(Kコード)の候補5件
+//   GET  /api/authinfo       … パスワード保護が有効かどうか(認証不要)
+//   POST /api/login          … パスワード照合 → トークン発行(認証不要)
+//
+// [必要な設定]
+//   KVバインディング: FORM_KV (変数名もFORM_KVにすること)
+//   Secret: OPENAI_API_KEY
+//   Secret: PW_OPE … 閲覧パスワード。未設定なら認証なしで動く
+//
+// [マスタJSONの形]
+//   {
+//     id: "tsarsa",
+//     name: "TSARSA（人工肩関節/リバース）",
+//     updatedAt: "2026-07-28T12:00:00.000Z",
+//     items: [
+//       { no:1, section:"基本項目", label:"入院手術／外来手術", type:"fixed",  value:"入院手術" },
+//       { no:2, section:"基本項目", label:"主たる術式　術式",   type:"ocr",    keyword:"施行術式", rule:"右側" },
+//       { no:3, section:"手術概要", label:"手術側",             type:"choice", choices:["左","右"], keyword:"施行術式", rule:"左右ピックアップ" },
+//       { no:4, section:"材料系",   label:"セメント",           type:"sticker", matKeywords:["セメント","CEMENT","Palacos"] },
+//       { no:5, section:"",         label:"技師数",             type:"confirm" },
+//       { no:6, section:"",         label:"手術日",             type:"unset" }
+//     ]
+//   }
+//
+//   type一覧:
+//     ocr     … 用紙をOCRして読む (keyword=用紙上のラベル / rule=抽出ルール)
+//     choice  … 選択肢から選ぶ  (choices=候補 / keyword / rule)
+//     fixed   … 固定値 (value)  ※OCR不要
+//     sticker … 材料シールから取得 (matKeywords=その材料を特定するキーワード群)
+//     confirm … 人が確認して入力
+//     unset   … 未マッピング
+//
+//   ※旧Excelの「読取りフォーカス」列(D列)は廃止。取込時に読み飛ばす。
+// ============================================================
+
+const KV_PREFIX = "master:";
+const DOCTORS_KEY = "staff:doctors";
+
+// ▼▼ 認証を外したいAPIがあればここに書く ▼▼
+//   既定は空 = すべてのAPIがパスワード保護される。
+//   例) ["/api/masters"] にすると、対象用紙の一覧だけログイン前でも取得できる。
+const AUTH_FREE_PATHS = [];
+// ▲▲ ここまで ▲▲
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    try {
+      // ---------- 画面 ----------
+      if (method === "GET" && (path === "/" || path === "")) {
+        return new Response(FRONT_HTML, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+      if (method === "GET" && (path === "/admin" || path === "/admin/")) {
+        return new Response(ADMIN_HTML, {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
+      }
+
+      // ---------- 認証 ----------
+      // 画面(HTML)は誰でも取得できるが、中身のAPIは保護する
+      if (method === "GET" && path === "/api/authinfo") {
+        return jsonOk({ required: authRequired(env) });
+      }
+      if (method === "POST" && path === "/api/login") {
+        return await apiLogin(env, await request.json());
+      }
+      if (path.startsWith("/api/") && AUTH_FREE_PATHS.indexOf(path) < 0 &&
+          !(await checkAuth(request, env))) {
+        return jsonError("認証が必要です", 401);
+      }
+
+      // ---------- API ----------
+      if (!env.FORM_KV) {
+        if (path.startsWith("/api/")) {
+          return jsonError("KVバインディング FORM_KV が設定されていません", 500);
+        }
+      }
+
+      if (method === "GET" && path === "/api/masters") {
+        return await listMasters(env);
+      }
+      if (method === "GET" && path === "/api/master") {
+        return await getMaster(env, url.searchParams.get("id"));
+      }
+      if (method === "POST" && path === "/api/master") {
+        return await saveMaster(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/master/delete") {
+        return await deleteMaster(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/extract") {
+        return await apiExtract(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/label") {
+        return await apiLabel(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/kcode") {
+        return await apiKcode(env, await request.json());
+      }
+      if (method === "GET" && path === "/api/doctors") {
+        return await apiGetDoctors(env);
+      }
+      if (method === "POST" && path === "/api/doctors") {
+        return await apiSaveDoctors(env, await request.json());
+      }
+
+      return new Response("Not Found", { status: 404 });
+    } catch (e) {
+      return jsonError((e && e.message) || "サーバーエラー", 500);
+    }
+  },
+};
+
+// ============================================================
+// APIハンドラ
+// ============================================================
+
+async function listMasters(env) {
+  const res = await env.FORM_KV.list({ prefix: KV_PREFIX });
+  const masters = [];
+  for (const k of res.keys) {
+    const id = k.name.slice(KV_PREFIX.length);
+    const m = k.metadata || {};
+    masters.push({
+      id,
+      name: m.name || id,
+      count: typeof m.count === "number" ? m.count : null,
+      stickerTodo: typeof m.stickerTodo === "number" ? m.stickerTodo : null,
+      updatedAt: m.updatedAt || null,
+    });
+  }
+  masters.sort((a, b) => String(a.name).localeCompare(String(b.name), "ja"));
+  return jsonOk({ masters });
+}
+
+async function getMaster(env, id) {
+  const clean = sanitizeId(id || "");
+  if (!clean) return jsonError("idが不正です", 400);
+  const raw = await env.FORM_KV.get(KV_PREFIX + clean);
+  if (!raw) return jsonError("マスタが見つかりません: " + clean, 404);
+  let obj;
+  try {
+    obj = JSON.parse(raw);
+  } catch (e) {
+    return jsonError("マスタJSONが壊れています: " + clean, 500);
+  }
+  return jsonOk({ master: obj });
+}
+
+async function saveMaster(env, body) {
+  const id = sanitizeId((body && body.id) || "");
+  if (!id) return jsonError("idが不正です(半角英数字・ハイフン・アンダースコアのみ)", 400);
+
+  const name = String((body && body.name) || "").trim() || id;
+  const rawItems = Array.isArray(body && body.items) ? body.items : [];
+
+  // 正規化(不要フィールドを落として型ごとに整形。noは並び順で振り直し)
+  const items = [];
+  for (let i = 0; i < rawItems.length; i++) {
+    const src = rawItems[i] || {};
+    const label = String(src.label || "").trim();
+    if (!label) continue; // ラベル空は捨てる
+    const type = normalizeType(src.type);
+    const it = {
+      no: items.length + 1,
+      section: String(src.section || "").trim(),
+      label,
+      type,
+    };
+    if (type === "fixed") {
+      it.value = String(src.value || "").trim();
+    }
+    if (type === "choice") {
+      it.choices = toArray(src.choices);
+    }
+    if (type === "ocr" || type === "choice") {
+      const kw = String(src.keyword || "").trim();
+      const rl = String(src.rule || "").trim();
+      if (kw) it.keyword = kw;
+      if (rl) it.rule = rl;
+      const sg = String(src.suggest || "").trim();
+      if (sg === "kcode" || sg === "doctor") it.suggest = sg;   // 候補リストを出す項目
+    }
+    if (type === "sticker") {
+      it.source = "label";
+      it.matKeywords = toArray(src.matKeywords);
+      it.ngKeywords = toArray(src.ngKeywords);
+    }
+    items.push(it);
+  }
+
+  if (!items.length) return jsonError("項目が1つもありません", 400);
+
+  const master = {
+    id,
+    name,
+    updatedAt: new Date().toISOString(),
+    items,
+  };
+
+  let stickerTodo = 0;
+  for (const it of items) {
+    if (it.type === "sticker" && (!it.matKeywords || !it.matKeywords.length)) stickerTodo++;
+  }
+
+  await env.FORM_KV.put(KV_PREFIX + id, JSON.stringify(master), {
+    metadata: {
+      name: master.name,
+      count: items.length,
+      stickerTodo,
+      updatedAt: master.updatedAt,
+    },
+  });
+
+  return jsonOk({ master, stickerTodo });
+}
+
+async function deleteMaster(env, body) {
+  const id = sanitizeId((body && body.id) || "");
+  if (!id) return jsonError("idが不正です", 400);
+  await env.FORM_KV.delete(KV_PREFIX + id);
+  return jsonOk({ deleted: id });
+}
+
+// ============================================================
+// ユーティリティ
+// ============================================================
+
+// ============================================================
+// 医師マスタ (氏名リスト)
+//   ハードコードせず KV に持つ。管理画面で編集・Excel取込ができる。
+// ============================================================
+// ============================================================
+// パスワード認証 (環境変数 PW_OPE)
+//   ・PW_OPE が未設定なら認証なし(自分でロックアウトしないため)
+//   ・画面だけでなく /api/* も保護する
+//   ・localStorage に入れるのは生パスワードではなくトークン(ハッシュ)
+// ============================================================
+async function sha256Hex(str) {
+  const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+  const arr = new Uint8Array(buf);
+  let out = "";
+  for (let i = 0; i < arr.length; i++) out += arr[i].toString(16).padStart(2, "0");
+  return out;
+}
+
+function authRequired(env) {
+  return !!(env && env.PW_OPE && String(env.PW_OPE).length > 0);
+}
+
+async function authToken(env) {
+  return await sha256Hex("opecopy:v1:" + String(env.PW_OPE || ""));
+}
+
+async function checkAuth(request, env) {
+  if (!authRequired(env)) return true;
+  const t = request.headers.get("x-ope-auth") || "";
+  if (!t) return false;
+  return t === (await authToken(env));
+}
+
+async function apiLogin(env, body) {
+  if (!authRequired(env)) return jsonOk({ token: "", required: false });
+  const pw = String((body && body.password) || "");
+  if (!pw || pw !== String(env.PW_OPE)) return jsonError("パスワードが違います", 401);
+  return jsonOk({ token: await authToken(env), required: true });
+}
+
+async function getDoctors(env) {
+  if (!env.FORM_KV) return [];
+  const raw = await env.FORM_KV.get(DOCTORS_KEY);
+  if (!raw) return [];
+  try {
+    const o = JSON.parse(raw);
+    return Array.isArray(o.names) ? o.names : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function apiGetDoctors(env) {
+  return jsonOk({ names: await getDoctors(env) });
+}
+
+async function apiSaveDoctors(env, body) {
+  const arr = Array.isArray(body && body.names) ? body.names : [];
+  const seen = {};
+  const names = [];
+  for (const n of arr) {
+    const t = String(n == null ? "" : n).trim();
+    if (!t || seen[t]) continue;      // 空行と重複は落とす
+    seen[t] = 1;
+    names.push(t);
+  }
+  await env.FORM_KV.put(DOCTORS_KEY, JSON.stringify({ names: names, updatedAt: new Date().toISOString() }));
+  return jsonOk({ names: names });
+}
+
+// 氏名比較用の正規化(空白を除く)
+function normName(s) {
+  const t = String(s == null ? "" : s);
+  let out = "";
+  for (let i = 0; i < t.length; i++) {
+    const c = t.charAt(i);
+    if (c === " " || c === "\u3000" || c === "\t") continue;
+    out += c;
+  }
+  return out;
+}
+
+function levDist(a, b) {
+  const m = a.length, n = b.length;
+  if (Math.abs(m - n) > 3) return 99;
+  let prev = [], cur = [];
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    cur[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    }
+    for (let k = 0; k <= n; k++) prev[k] = cur[k];
+  }
+  return prev[n];
+}
+
+// 読み取った氏名を医師マスタの最も近い名前へ寄せる(1〜2文字の誤読を吸収)
+function snapOneName(text, names) {
+  const t = normName(text);
+  if (!t) return { value: text, from: null };
+  let best = null, bestD = 99;
+  for (const n of names) {
+    const d = levDist(t, normName(n));
+    if (d < bestD) { bestD = d; best = n; }
+  }
+  if (best === null) return { value: text, from: null };
+  if (bestD === 0) return { value: best, from: null };       // 表記を揃えるだけ
+  const allow = t.length <= 3 ? 1 : 2;                        // 短い名前ほど厳しく
+  if (bestD <= allow) return { value: best, from: text };     // 補正した
+  return { value: text, from: null };                         // 遠すぎるので触らない
+}
+
+// 「A、B」形式の複数名にも対応
+function snapNames(value, names) {
+  if (!value || !names.length) return { value: value, fixes: [] };
+  const parts = String(value).split("、");
+  const out = [], fixes = [];
+  for (const p of parts) {
+    const t = p.trim();
+    if (!t) continue;
+    const r = snapOneName(t, names);
+    out.push(r.value);
+    if (r.from) fixes.push(r.from + " → " + r.value);
+  }
+  return { value: out.join("、"), fixes: fixes };
+}
+
+function normalizeType(t) {
+  const ok = ["ocr", "choice", "fixed", "sticker", "confirm", "unset"];
+  const s = String(t || "").trim();
+  return ok.indexOf(s) >= 0 ? s : "unset";
+}
+
+function toArray(v) {
+  if (Array.isArray(v)) {
+    const out = [];
+    for (const x of v) {
+      const s = String(x == null ? "" : x).trim();
+      if (s) out.push(s);
+    }
+    return out;
+  }
+  const s = String(v == null ? "" : v);
+  if (!s.trim()) return [];
+  const parts = s.split("、").join(",").split(",");
+  const out = [];
+  for (const p of parts) {
+    const t = p.trim();
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+function sanitizeId(s) {
+  const lower = String(s || "").trim().toLowerCase();
+  let out = "";
+  for (let i = 0; i < lower.length; i++) {
+    const c = lower.charAt(i);
+    const isNum = c >= "0" && c <= "9";
+    const isAl = c >= "a" && c <= "z";
+    if (isNum || isAl || c === "-" || c === "_") out += c;
+  }
+  return out.slice(0, 60);
+}
+
+function jsonOk(obj) {
+  return new Response(JSON.stringify(Object.assign({ ok: true }, obj)), {
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+function jsonError(message, status) {
+  return new Response(JSON.stringify({ ok: false, error: message }), {
+    status: status || 400,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+// ============================================================
+// ▼▼ [フェーズ②] 抽出API / 材料シールAPI ここから ▼▼
+// ============================================================
+
+// ▼▼ モデルを変えたいときはここ ▼▼
+//  【重要】画像を扱う場合、gpt-4o-mini は "安くない"。
+//   miniは画像を約33倍のトークンとして数える(単価が1/33なので金額はほぼ同じ)。
+//   A4スキャン1枚 high detail の実測概算:
+//       gpt-4o      →  約 1,100 トークン / $0.0028
+//       gpt-4o-mini → 約 36,800 トークン / $0.0055
+//   TPM(1分あたりトークン数)の上限は金額ではなくトークン数で効くため、
+//   miniだと画像5枚ほどで 200,000 TPM に達して 429 が出る。
+//   → 画像主体の本ツールでは gpt-4o の方が「安く・速く・正確」。
+const MODEL_EXTRACT = "gpt-4o";  // 記録面(用紙)の読み取り
+const MODEL_LABEL   = "gpt-4o";  // 材料シールの読み取り
+// ▲▲ モデル設定ここまで ▲▲
+
+const EXTRACT_CHUNK  = 8;   // 1回の呼び出しで聞く項目数。多すぎると○判定が雑になるので小さめ
+
+// ▼▼ 【重要】OpenAIのTPM(1分あたりトークン数)上限に合わせた設定 ▼▼
+//   gpt-4o は Tier 1 だと 30,000 TPM しかない。
+//   1症例の読み取りで使う量の目安(TSARSA・44項目):
+//       EXTRACT_PASSES=1 かつ 全面を送らない … 約 22,000  → 30,000枠に収まる
+//       EXTRACT_PASSES=2 かつ 全面も送る     … 約 50,000  → 枠を超えて429になる
+//   累計 $50 以上の支払いで Tier 2 になると 450,000 TPM まで上がるので、
+//   その場合は EXTRACT_PASSES=2 / SEND_FULL_PAGE=true に戻して精度重視にできる。
+//   現在のティアは platform.openai.com の Settings → Limits で確認できる。
+const EXTRACT_PASSES = 1;   // 同じ項目を何回読ませて突き合わせるか(2にすると読み取りのブレを検出できるが倍のトークンを使う)
+const SEND_FULL_PAGE = false; // 記録面で「全面」も送るか(帯だけで全体を覆えているのでfalseで足りる)
+const EXTRACT_CONCURRENCY = 2;  // AI呼び出しの同時実行数
+// ▲▲ ここまで ▲▲
+
+const MAX_RETRY      = 6;   // 429/5xx のリトライ回数(TPMの枠が空くのを待てるよう多め)
+async function loadMaster(env, id) {
+  const clean = sanitizeId(id || "");
+  if (!clean) return null;
+  const raw = await env.FORM_KV.get(KV_PREFIX + clean);
+  if (!raw) return null;
+  try {
+    const m = JSON.parse(raw);
+    if (!m.items) m.items = [];
+    return m;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---------- 用紙OCR抽出 ----------
+async function apiExtract(env, body) {
+  if (!env.OPENAI_API_KEY) return jsonError("OPENAI_API_KEY が設定されていません", 500);
+
+  const masterId = sanitizeId((body && body.masterId) || "");
+  const pages = Array.isArray(body && body.pages) ? body.pages : [];
+  if (!masterId) return jsonError("masterIdが不正です", 400);
+  if (!pages.length) return jsonError("記録面の画像がありません", 400);
+
+  const master = await loadMaster(env, masterId);
+  if (!master) return jsonError("マスタが見つかりません: " + masterId, 404);
+
+  const results = {};
+  const disagreeOut = {};
+  const snapOut = {};                       // 氏名を補正した記録
+  const doctors = await getDoctors(env);
+  const doctorFields = [];                  // 医師マスタを使う項目名
+  for (const it of master.items) {
+    if (it.suggest === "doctor") doctorFields.push(it.label);
+  }
+
+  // 固定値はOCR不要 — サーバー側でそのまま埋める
+  for (const it of master.items) {
+    if (it.type === "fixed") results[String(it.no)] = it.value || "";
+  }
+
+  // OCR対象(ocr / choice)だけをAIに投げる
+  const targets = master.items.filter((it) => it.type === "ocr" || it.type === "choice");
+
+  // 記録面を {num, image} に正規化(文字列だけの旧形式も受ける)
+  const pageList = [];
+  for (const p of pages) {
+    if (typeof p === "string" && p.indexOf("data:image/") === 0) pageList.push({ num: 0, image: p });
+    else if (p && typeof p.image === "string" && p.image.indexOf("data:image/") === 0) {
+      pageList.push({ num: Number(p.num) || 0, image: p.image });
+    }
+  }
+  if (!pageList.length) return jsonError("画像データが不正です", 400);
+
+  let usage = null;
+  if (targets.length) {
+    // ルール文中の「1P目」「2P目」でページを絞る → 送る画像が減り、AIの探索範囲も狭まる
+    const groups = new Map();
+    for (const it of targets) {
+      const h = pageHintOf(it);
+      if (!groups.has(h)) groups.set(h, []);
+      groups.get(h).push(it);
+    }
+
+    const got = {};
+    const disagree = {};
+
+    // 一度に多くを聞くと精度が落ちるので小分けにする
+    const chunkDefs = [];
+    for (const [hint, list] of groups) {
+      const imgs = pickImages(pageList, hint);
+      for (let i = 0; i < list.length; i += EXTRACT_CHUNK) {
+        chunkDefs.push({ chunk: list.slice(i, i + EXTRACT_CHUNK), imgs: imgs });
+      }
+    }
+
+    // チャンク × パス を並行実行する(直列だと待ち時間が積み上がるため)
+    const jobs = [];
+    for (let ci = 0; ci < chunkDefs.length; ci++) {
+      for (let pass = 0; pass < EXTRACT_PASSES; pass++) {
+        jobs.push({ ci: ci, run: (function (d) {
+          return function () { return extractChunk(env, d.chunk, d.imgs, doctors); };
+        })(chunkDefs[ci]) });
+      }
+    }
+    const done = await runPool(jobs.map(function (j) { return j.run; }), EXTRACT_CONCURRENCY);
+
+    const byChunk = [];
+    for (let k = 0; k < jobs.length; k++) {
+      const ci = jobs[k].ci;
+      if (!byChunk[ci]) byChunk[ci] = [];
+      const part = done[k] || {};
+      byChunk[ci].push(part.results || {});
+      if (part.usage) {
+        if (!usage) usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+        usage.prompt_tokens += part.usage.prompt_tokens || 0;
+        usage.completion_tokens += part.usage.completion_tokens || 0;
+        usage.total_tokens += part.usage.total_tokens || 0;
+      }
+    }
+
+    // 同じ問いの複数回答を突き合わせる。幻覚は毎回違う値になるので炙り出せる
+    for (let ci = 0; ci < chunkDefs.length; ci++) {
+      const passes = byChunk[ci] || [];
+      for (const it of chunkDefs[ci].chunk) {
+        const key = String(it.no);
+        const vals = [];
+        for (const r of passes) vals.push(String(r[key] == null ? "" : r[key]).trim());
+        got[key] = voteStr(vals);
+        let allSame = true;
+        for (const v of vals) if (v !== vals[0]) allSame = false;
+        if (!allSame) disagree[key] = vals;
+      }
+    }
+
+    for (const it of targets) {
+      const key = String(it.no);
+      let v = got[key];
+      if (v == null) v = "";
+      v = String(v).trim();
+      if (it.choices && it.choices.length && v) {
+        let ok = false;
+        for (const c of it.choices) { if (String(c).trim() === v) { ok = true; break; } }
+        if (!ok) v = "";
+      }
+      // 医師マスタがある項目は、最も近い氏名へ寄せる(室置→玉置 のような1文字誤読の吸収)
+      if (it.suggest === "doctor" && v && doctors.length) {
+        const sn = snapNames(v, doctors);
+        if (sn.fixes.length) snapOut[key] = sn.fixes;
+        v = sn.value;
+      }
+      results[key] = v;
+      if (disagree[key]) disagreeOut[key] = disagree[key];
+    }
+  }
+
+  return jsonOk({
+    results: results, master: master, usage: usage,
+    disagree: disagreeOut, snapped: snapOut,
+    doctorInfo: { count: doctors.length, fields: doctorFields },
+  });
+}
+
+// 複数回の読み取り結果から最頻値を採る(同数なら空でない最初の値)
+function voteStr(vals) {
+  const counts = {};
+  let best = "", bestN = 0;
+  for (const v of vals) {
+    if (!v) continue;
+    counts[v] = (counts[v] || 0) + 1;
+    if (counts[v] > bestN) { best = v; bestN = counts[v]; }
+  }
+  return best;
+}
+
+// 1チャンク分をAIに投げる
+async function extractChunk(env, chunk, imgs, doctors) {
+  const spec = chunk.map((it) => {
+    const o = { no: it.no, 項目名: it.label };
+    if (it.keyword) o.用紙上の目印 = it.keyword;
+    if (it.rule) o.抽出ルール = it.rule;
+    if (it.choices && it.choices.length) o.選択肢 = it.choices;
+    // 医師マスタを持つ項目には候補氏名を渡す(表記の手がかりになる)
+    if (it.suggest === "doctor" && doctors && doctors.length) {
+      o.補足 = "この項目は院内の医師名簿から選ぶ。用紙の字と一字一句同じでなくてよいので、字形が最も近い医師を名簿から選ぶこと。該当が全く無ければ空の配列を返す。";
+    }
+    return o;
+  });
+
+  // 画像を先、指示を後 — オペパシャと同じ並び
+  const content = [];
+  for (const p of imgs) content.push({ type: "image_url", image_url: { url: p, detail: "high" } });
+  content.push({ type: "text", text: EXTRACT_USER_HEAD + JSON.stringify(spec, null, 1) });
+
+  // strict schema: 聞いた項目を必ず全部、文字列で返させる(欠落・余計なキーを封じる)
+  const props = {};
+  const required = [];
+  for (const it of chunk) {
+    const k = "n" + it.no;
+    // 医師マスタを持つ項目は enum にする = リストに無い氏名は構造的に返せない
+    if (it.suggest === "doctor" && doctors && doctors.length) {
+      props[k] = {
+        type: "array",
+        description: (it.label + " / 用紙の字に最も近い医師を候補から選ぶ。該当が無ければ空の配列。").slice(0, 300),
+        items: { type: "string", enum: doctors },
+      };
+    } else {
+      let desc = it.label;
+      if (it.choices && it.choices.length) desc += " / 次のいずれか1つ、または空文字: " + it.choices.join(" , ");
+      props[k] = { type: "string", description: desc.slice(0, 300) };
+    }
+    required.push(k);
+  }
+  const schema = {
+    name: "extract_result",
+    strict: true,
+    schema: { type: "object", additionalProperties: false, properties: props, required: required },
+  };
+
+  const out = await callOpenAI(
+    env, MODEL_EXTRACT,
+    [
+      { role: "system", content: EXTRACT_SYSTEM },
+      { role: "user", content: content },
+    ],
+    2000, schema
+  );
+
+  const results = {};
+  const raw = out.json || {};
+  for (const it of chunk) {
+    const v = raw["n" + it.no];
+    if (Array.isArray(v)) results[String(it.no)] = v.join("、");     // 医師は配列で返る
+    else results[String(it.no)] = (v == null) ? "" : String(v);
+  }
+  return { results: results, usage: out.usage || null };
+}
+
+// ルール/目印に書かれたページ指定を拾う(0 = 指定なし)
+function pageHintOf(it) {
+  const s = String(it.rule || "") + " " + String(it.keyword || "");
+  if (s.indexOf("1P") >= 0 || s.indexOf("1ページ") >= 0) return 1;
+  if (s.indexOf("2P") >= 0 || s.indexOf("2ページ") >= 0) return 2;
+  if (s.indexOf("3P") >= 0 || s.indexOf("3ページ") >= 0) return 3;
+  return 0;
+}
+
+function pickImages(pageList, hint) {
+  if (hint > 0) {
+    const hit = [];
+    for (const p of pageList) if (p.num === hint) hit.push(p.image);
+    if (hit.length) return hit;
+  }
+  const all = [];
+  for (const p of pageList) all.push(p.image);
+  return all;
+}
+
+// ---------- 材料シール読取 ----------
+async function apiLabel(env, body) {
+  if (!env.OPENAI_API_KEY) return jsonError("OPENAI_API_KEY が設定されていません", 500);
+
+  const image = (body && body.image) || "";
+  if (typeof image !== "string" || image.indexOf("data:image/") !== 0) {
+    return jsonError("画像データが不正です", 400);
+  }
+
+  const out = await callOpenAI(
+    env,
+    MODEL_LABEL,
+    [
+      { role: "system", content: LABEL_SYSTEM },
+      {
+        role: "user",
+        content: [
+          { type: "image_url", image_url: { url: image, detail: "high" } },
+          { type: "text", text: "この画像からすべての材料ラベル情報を抽出してください。" },
+        ],
+      },
+    ],
+    4000, LABEL_SCHEMA
+  );
+
+  const rawItems = (out.json && out.json.items) || [];
+  const items = [];
+  for (const r of rawItems) {
+    if (!r) continue;
+    const title = String(r.title || "").trim();
+    if (!title) continue;
+    let lot = String(r.lot || "").trim();
+    let exp0 = String(r.exp || "").trim();
+    // このメーカーのラベルは SN のみで LOT が無いものが多く、期限をLOT欄に入れる誤りが多発する
+    if (looksLikeDate(lot)) { if (!exp0) exp0 = lot; lot = ""; }
+    const gtinDigits = onlyDigits(r.gtin || "");
+    const gtinValid = gtinLenOk(gtinDigits) && gtinCheckOk(gtinDigits);
+    const gtin = gtinValid ? gtinDigits : "";               // 検証を通らない値は採用しない
+    const gtinRaw = (!gtinValid && gtinDigits) ? gtinDigits : "";
+    const gtinNg = !!gtinRaw;
+    const exp = exp0;
+    items.push({
+      title: title,
+      gtin: gtin,
+      gtinRaw: gtinRaw,         // 検証を通らなかった生の読み取り値
+      gtinNg: gtinNg,           // ⚠️要確認フラグ(チェックデジット不一致)
+      expNg: isPastDate(exp),   // ⚠️要確認フラグ(期限が過去=年の誤読の可能性)
+      ref: String(r.ref || "").trim(),
+      lot: lot,
+      sn: String(r.sn || "").trim(),
+      maker: String(r.maker || "").trim(),
+      exp: exp,
+    });
+  }
+
+  return jsonOk({ items: items, usage: out.usage || null });
+}
+
+// ---------- OpenAI呼び出し ----------
+function sleep(ms) {
+  return new Promise(function (r) { setTimeout(r, ms); });
+}
+
+// 同時実行数を制限しながら並行に走らせる(順番は保持)
+async function runPool(tasks, limit) {
+  const out = new Array(tasks.length);
+  let next = 0;
+  const n = Math.min(Math.max(1, limit), tasks.length);
+  const workers = [];
+  for (let w = 0; w < n; w++) {
+    workers.push((async function () {
+      while (true) {
+        const my = next++;
+        if (my >= tasks.length) break;
+        out[my] = await tasks[my]();
+      }
+    })());
+  }
+  await Promise.all(workers);
+  return out;
+}
+
+// レスポンスから「どれだけ待てばよいか」を割り出す
+function retryWaitMs(res, text, attempt) {
+  const raMs = res.headers.get("retry-after-ms");
+  if (raMs) {
+    const n = Number(raMs);
+    if (!isNaN(n) && n > 0) return Math.min(n + 250, 65000);
+  }
+  const ra = res.headers.get("retry-after");
+  if (ra) {
+    const n = Number(ra);
+    if (!isNaN(n) && n > 0) return Math.min(n * 1000 + 250, 65000);
+  }
+  // 本文の "Please try again in 387ms" / "in 1.5s" を拾う
+  const m = /try again in ([0-9.]+)\s*(ms|s)\b/i.exec(String(text || ""));
+  if (m) {
+    const v = parseFloat(m[1]);
+    if (!isNaN(v)) {
+      const ms = (m[2].toLowerCase() === "ms") ? v : v * 1000;
+      return Math.min(ms + 800, 65000);
+    }
+  }
+  return Math.min(1500 * Math.pow(2, attempt) + Math.floor(Math.random() * 500), 65000);
+}
+
+async function callOpenAI(env, model, messages, maxTokens, schema) {
+  let lastMsg = "";
+  let res = null;
+
+  for (let attempt = 0; attempt <= MAX_RETRY; attempt++) {
+    res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer " + env.OPENAI_API_KEY,
+      },
+      body: JSON.stringify({
+        model: model,
+        messages: messages,
+        max_completion_tokens: maxTokens || 2000,
+        temperature: 0,
+        response_format: schema
+          ? { type: "json_schema", json_schema: schema }
+          : { type: "json_object" },
+      }),
+    });
+    if (res.ok) break;
+
+    const t = await res.text();
+    lastMsg = "OpenAIエラー(" + res.status + "): " + t.slice(0, 300);
+    // 429(レート制限)と5xx(一時障害)だけ待って再試行
+    if (res.status === 429 || res.status >= 500) {
+      if (attempt === MAX_RETRY) {
+        if (res.status === 429 && t.indexOf("tokens per min") >= 0) {
+          throw new Error(
+            "OpenAIの1分あたりトークン上限(TPM)に達しました。1症例で使う量が上限を超えています。" +
+            "コード冒頭の EXTRACT_PASSES を 1 に、SEND_FULL_PAGE を false にすると使用量が半分以下になります。" +
+            "根本的には OpenAI の利用ティアを上げると上限が大きく上がります（Settings → Limits で確認できます）。"
+          );
+        }
+        throw new Error(lastMsg + " ／ 再試行しても解消しませんでした");
+      }
+      await sleep(retryWaitMs(res, t, attempt));
+      continue;
+    }
+    throw new Error(lastMsg);
+  }
+  if (!res || !res.ok) throw new Error(lastMsg || "OpenAI呼び出しに失敗しました");
+
+  const data = await res.json();
+  const text = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch (e) {
+    throw new Error("AIの応答がJSONとして読めませんでした");
+  }
+  return { json: json, usage: data.usage || null };
+}
+
+// ---------- YYYY-MM-DD 形式かどうか ----------
+function looksLikeDate(s) {
+  const t = String(s || "").trim();
+  if (t.length !== 10) return false;
+  if (t.charAt(4) !== "-" || t.charAt(7) !== "-") return false;
+  for (let i = 0; i < 10; i++) {
+    if (i === 4 || i === 7) continue;
+    const c = t.charAt(i);
+    if (c < "0" || c > "9") return false;
+  }
+  return true;
+}
+
+// ---------- 期限の妥当性(過去日付は年の誤読を疑う) ----------
+function isPastDate(s) {
+  const t = String(s || "").trim();
+  if (t.length < 7) return false;
+  const d = Date.parse(t);
+  if (isNaN(d)) return false;
+  return d < Date.now();
+}
+
+// ---------- GTINチェックデジット(モジュロ10) ----------
+function onlyDigits(s) {
+  const str = String(s || "");
+  let out = "";
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charAt(i);
+    if (c >= "0" && c <= "9") out += c;
+  }
+  return out;
+}
+
+function gtinLenOk(g) {
+  return g.length === 8 || g.length === 12 || g.length === 13 || g.length === 14;
+}
+
+// モジュロ10。チェックデジットから数えて奇数位置を3倍(桁数可変)
+function gtinCheckOk(gtin) {
+  if (!gtinLenOk(gtin)) return false;
+  const n = gtin.length;
+  let sum = 0;
+  for (let i = 0; i < n - 1; i++) {
+    const d = gtin.charCodeAt(i) - 48;
+    sum += ((n - 1 - i) % 2 === 1) ? d * 3 : d;
+  }
+  const cd = (10 - (sum % 10)) % 10;
+  return cd === (gtin.charCodeAt(n - 1) - 48);
+}
+
+
+// ============================================================
+// 術式候補 (Kコード) — オペパシャの /api/search と同じ方式
+//   AIが返したコードをローカルの正データに逆引きし、
+//   リストに無いコードは捨てる → 転記ミス・幻覚が構造的に起きない
+// ============================================================
+const MODEL_KCODE = "gpt-4o-mini";   // 画像を使わない文字だけの処理なのでminiで十分・安い
+
+const KCODE_DATA = [
+  ["K010 2", "瘢痕拘縮形成手術（その他）", "150004910"],
+  ["K015 1", "皮弁作成術、移動術、切断術、遷延皮弁術（２５平方センチメートル未満）", "150007810"],
+  ["K015 2", "皮弁作成術、移動術、切断術、遷延皮弁術（２５平方センチメートル以上１００平方センチメートル未満）", "150007910"],
+  ["K015 3", "皮弁作成術、移動術、切断術、遷延皮弁術（１００平方センチメートル以上）", "150008010"],
+  ["K016", "動脈（皮）弁術", "150008810"],
+  ["K016", "筋（皮）弁術", "150009010"],
+  ["K017 2", "遊離皮弁術（顕微鏡下血管柄付きのもの）（その他の場合）", "150371810"],
+  ["K019", "複合組織移植術", "150009110"],
+  ["K020", "自家遊離複合組織移植術（顕微鏡下血管柄付きのもの）", "150009210"],
+  ["K022 2", "組織拡張器による再建手術（一連につき）（その他の場合）", "150372010"],
+  ["K023", "筋膜切離術", "150009410"],
+  ["K023", "筋膜切開術", "150009510"],
+  ["K024", "筋切離術", "150009610"],
+  ["K025", "股関節内転筋切離術", "150009710"],
+  ["K026", "股関節筋群解離術", "150009810"],
+  ["K026-2", "股関節周囲筋腱解離術（変形性股関節症）", "150308510"],
+  ["K027 1", "筋炎手術（腸腰筋）", "150009910"],
+  ["K027 1", "筋炎手術（殿筋）", "150010010"],
+  ["K027 1", "筋炎手術（大腿筋）", "150010110"],
+  ["K027 2", "筋炎手術（その他の筋炎手術）", "150010210"],
+  ["K030 1", "四肢・躯幹軟部腫瘍摘出術（肩軟部腫瘍摘出術）", "150010810"],
+  ["K030 2", "四肢・躯幹軟部腫瘍摘出術（上腕軟部腫瘍摘出術）", "150010910"],
+  ["K030 3", "四肢・躯幹軟部腫瘍摘出術（前腕軟部腫瘍摘出術）", "150011010"],
+  ["K030 4", "四肢・躯幹軟部腫瘍摘出術（大腿軟部腫瘍摘出術）", "150011110"],
+  ["K030 5", "四肢・躯幹軟部腫瘍摘出術（下腿軟部腫瘍摘出術）", "150011210"],
+  ["K030 6", "四肢・躯幹軟部腫瘍摘出術（躯幹軟部腫瘍摘出術）", "150308610"],
+  ["K030 7", "四肢・躯幹軟部腫瘍摘出術（手軟部腫瘍摘出術）", "150011310"],
+  ["K030 8", "四肢・躯幹軟部腫瘍摘出術（足軟部腫瘍摘出術）", "150011410"],
+  ["K031 1", "四肢・躯幹軟部悪性腫瘍手術（肩軟部悪性腫瘍手術）", "150011510"],
+  ["K031 2", "四肢・躯幹軟部悪性腫瘍手術（上腕軟部悪性腫瘍手術）", "150011610"],
+  ["K031 3", "四肢・躯幹軟部悪性腫瘍手術（前腕軟部悪性腫瘍手術）", "150011710"],
+  ["K031 4", "四肢・躯幹軟部悪性腫瘍手術（大腿軟部悪性腫瘍手術）", "150011810"],
+  ["K031 5", "四肢・躯幹軟部悪性腫瘍手術（下腿軟部悪性腫瘍手術）", "150011910"],
+  ["K031 6", "四肢・躯幹軟部悪性腫瘍手術（躯幹軟部悪性腫瘍手術）", "150308710"],
+  ["K031 7", "四肢・躯幹軟部悪性腫瘍手術（手軟部悪性腫瘍手術）", "150012010"],
+  ["K031 8", "四肢・躯幹軟部悪性腫瘍手術（足軟部悪性腫瘍手術）", "150012110"],
+  ["K033 1", "筋膜移植術（手指及び足趾筋膜移植術）", "150013110"],
+  ["K033 2", "筋膜移植術（その他の筋膜移植術）", "150272910"],
+  ["K034 1", "腱切離・切除術", "150456210"],
+  ["K034 2", "腱切離・切除術（内視鏡下）", "150456410"],
+  ["K035 1", "腱剥離術", "150456610"],
+  ["K035 2", "腱剥離術（内視鏡下）", "150456810"],
+  ["K035-2", "腱滑膜切除術", "150300110"],
+  ["K037", "腱縫合術", "150288910"],
+  ["K037-2", "アキレス腱断裂修復手術", "150280050"],
+  ["K038", "腱延長術", "150289010"],
+  ["K039 1", "腱移植術（人工腱形成術を含む。）（手指腱移植術）", "150457010"],
+  ["K039 2", "腱移植術（人工腱形成術を含む。）（足趾腱移植術）", "150457110"],
+  ["K039 3", "腱移植術（人工腱形成術を含む。）（その他の腱移植術）", "150013510"],
+  ["K040 1", "腱移行術（手指及び足趾腱移行術）", "150273110"],
+  ["K040 2", "腱移行術（その他の腱移行術）", "150013410"],
+  ["K040-2", "指伸筋腱脱臼観血的整復術", "150343610"],
+  ["K040-3", "腓骨筋腱腱鞘形成術", "150383610"],
+  ["K043 1", "骨掻爬術（肩甲骨掻爬術）", "150013810"],
+  ["K043 2", "骨掻爬術（上腕骨掻爬術）", "150013910"],
+  ["K043 3", "骨掻爬術（大腿骨掻爬術）", "150014010"],
+  ["K043 4", "骨掻爬術（前腕骨掻爬術）", "150014110"],
+  ["K043 5", "骨掻爬術（下腿骨掻爬術）", "150014210"],
+  ["K043 6", "骨掻爬術（鎖骨骨掻爬術）", "150014310"],
+  ["K043 7", "骨掻爬術（膝蓋骨掻爬術）", "150014410"],
+  ["K043 8", "骨掻爬術（手部骨掻爬術）", "150014510"],
+  ["K043 9", "骨掻爬術（足部骨掻爬術）", "150457210"],
+  ["K043 10", "骨掻爬術（その他の骨掻爬術）", "150457310"],
+  ["K045 1", "骨折経皮的鋼線刺入固定術（肩甲骨骨折経皮的鋼線刺入固定術）", "150018110"],
+  ["K045 2", "骨折経皮的鋼線刺入固定術（上腕骨骨折経皮的鋼線刺入固定術）", "150018210"],
+  ["K045 3", "骨折経皮的鋼線刺入固定術（大腿骨骨折経皮的鋼線刺入固定術）", "150018310"],
+  ["K045 4", "骨折経皮的鋼線刺入固定術（前腕骨骨折経皮的鋼線刺入固定術）", "150018410"],
+  ["K045 5", "骨折経皮的鋼線刺入固定術（下腿骨骨折経皮的鋼線刺入固定術）", "150018510"],
+  ["K045 6", "骨折経皮的鋼線刺入固定術（鎖骨骨折経皮的鋼線刺入固定術）", "150018610"],
+  ["K045 7", "骨折経皮的鋼線刺入固定術（膝蓋骨骨折経皮的鋼線刺入固定術）", "150018710"],
+  ["K045 8", "骨折経皮的鋼線刺入固定術（手根骨骨折経皮的鋼線刺入固定術）", "150457610"],
+  ["K045 9", "骨折経皮的鋼線刺入固定術（中手骨骨折経皮的鋼線刺入固定術）", "150457710"],
+  ["K045 10", "骨折経皮的鋼線刺入固定術（手指骨骨折経皮的鋼線刺入固定術）", "150457810"],
+  ["K045 11", "骨折経皮的鋼線刺入固定術（足根骨骨折経皮的鋼線刺入固定術）", "150457910"],
+  ["K045 12", "骨折経皮的鋼線刺入固定術（中足骨骨折経皮的鋼線刺入固定術）", "150458010"],
+  ["K045 13", "骨折経皮的鋼線刺入固定術（足趾骨骨折経皮的鋼線刺入固定術）", "150458110"],
+  ["K045 14", "骨折経皮的鋼線刺入固定術（その他の骨折経皮的鋼線刺入固定術）", "150289110"],
+  ["K046 1", "骨折観血的手術（肩甲骨骨折観血的手術）", "150019010"],
+  ["K046 2", "骨折観血的手術（上腕骨骨折観血的手術）", "150019110"],
+  ["K046 3", "骨折観血的手術（大腿骨骨折観血的手術）", "150019210"],
+  ["K046 4", "骨折観血的手術（前腕骨骨折観血的手術）", "150019310"],
+  ["K046 5", "骨折観血的手術（下腿骨骨折観血的手術）", "150019410"],
+  ["K046 6", "骨折観血的手術（手舟状骨骨折観血的手術）", "150294810"],
+  ["K046 7", "骨折観血的手術（鎖骨骨折観血的手術）", "150019510"],
+  ["K046 8", "骨折観血的手術（膝蓋骨骨折観血的手術）", "150019610"],
+  ["K046 9", "骨折観血的手術（手根骨（舟状骨を除く。）骨折観血的手術）", "150458210"],
+  ["K046 10", "骨折観血的手術（中手骨骨折観血的手術）", "150458310"],
+  ["K046 11", "骨折観血的手術（手指骨骨折観血的手術）", "150458410"],
+  ["K046 12", "骨折観血的手術（足根骨骨折観血的手術）", "150458510"],
+  ["K046 13", "骨折観血的手術（中足骨骨折観血的手術）", "150458610"],
+  ["K046 14", "骨折観血的手術（足趾骨骨折観血的手術）", "150458710"],
+  ["K046 15", "骨折観血的手術（その他の骨折観血的手術）", "150289210"],
+  ["K046-2 1", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（肩甲骨骨折観血的整復固定術）", "150352010"],
+  ["K046-2 2", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（上腕骨骨折観血的整復固定術）", "150352110"],
+  ["K046-2 3", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（大腿骨骨折観血的整復固定術）", "150352210"],
+  ["K046-2 4", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（前腕骨骨折観血的整復固定術）", "150352310"],
+  ["K046-2 5", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（下腿骨骨折観血的整復固定術）", "150352410"],
+  ["K046-2 6", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（手根骨骨折観血的整復固定術）", "150458810"],
+  ["K046-2 7", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（中手骨骨折観血的整復固定術）", "150458910"],
+  ["K046-2 8", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（手指骨骨折観血的整復固定術）", "150459010"],
+  ["K046-2 9", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（足根骨骨折観血的整復固定術）", "150459110"],
+  ["K046-2 10", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（中足骨骨折観血的整復固定術）", "150459210"],
+  ["K046-2 11", "骨折観血的整復固定術（インプラント周囲骨折に対するもの）（足趾骨骨折観血的整復固定術）", "150459310"],
+  ["K046-3 1", "骨折一時的創外固定術（上腕骨骨折一時的創外固定術）", "150459410"],
+  ["K046-3 2", "骨折一時的創外固定術（前腕骨骨折一時的創外固定術）", "150459510"],
+  ["K046-3 3", "骨折一時的創外固定術（手部骨折一時的創外固定術）", "150459610"],
+  ["K046-3 4", "骨折一時的創外固定術（大腿骨骨折一時的創外固定術）", "150459710"],
+  ["K046-3 5", "骨折一時的創外固定術（膝蓋骨骨折一時的創外固定術）", "150459810"],
+  ["K046-3 6", "骨折一時的創外固定術（下腿骨骨折一時的創外固定術）", "150459910"],
+  ["K046-3 7", "骨折一時的創外固定術（足部骨折一時的創外固定術）", "150460010"],
+  ["K046-3 8", "骨折一時的創外固定術（脊椎骨折一時的創外固定術）", "150460110"],
+  ["K046-3 9", "骨折一時的創外固定術（骨盤骨折一時的創外固定術）", "150460210"],
+  ["K049 1", "骨部分切除術（肩甲骨部分切除術）", "150021410"],
+  ["K049 2", "骨部分切除術（上腕骨部分切除術）", "150021510"],
+  ["K049 3", "骨部分切除術（大腿骨部分切除術）", "150021610"],
+  ["K049 4", "骨部分切除術（前腕骨部分切除術）", "150021710"],
+  ["K049 5", "骨部分切除術（下腿骨部分切除術）", "150021810"],
+  ["K049 6", "骨部分切除術（鎖骨部分切除術）", "150021910"],
+  ["K049 7", "骨部分切除術（膝蓋骨部分切除術）", "150022010"],
+  ["K049 8", "骨部分切除術（手根骨部分切除術）", "150460910"],
+  ["K049 9", "骨部分切除術（中手骨部分切除術）", "150461010"],
+  ["K049 10", "骨部分切除術（手指骨部分切除術）", "150461110"],
+  ["K049 11", "骨部分切除術（足根骨部分切除術）", "150461210"],
+  ["K049 12", "骨部分切除術（中足骨部分切除術）", "150461310"],
+  ["K049 13", "骨部分切除術（足趾骨部分切除術）", "150461410"],
+  ["K049 14", "骨部分切除術（その他の骨部分切除術）", "150289410"],
+  ["K050 1", "腐骨摘出術（肩甲骨腐骨摘出術）", "150022510"],
+  ["K050 2", "腐骨摘出術（上腕骨腐骨摘出術）", "150022610"],
+  ["K050 3", "腐骨摘出術（大腿骨腐骨摘出術）", "150022710"],
+  ["K050 4", "腐骨摘出術（前腕骨腐骨摘出術）", "150022810"],
+  ["K050 5", "腐骨摘出術（下腿骨腐骨摘出術）", "150022910"],
+  ["K050 6", "腐骨摘出術（鎖骨腐骨摘出術）", "150023010"],
+  ["K050 7", "腐骨摘出術（膝蓋骨腐骨摘出術）", "150023110"],
+  ["K050 8", "腐骨摘出術（手部腐骨摘出術）", "150023210"],
+  ["K050 9", "腐骨摘出術（足部腐骨摘出術）", "150461510"],
+  ["K050 10", "腐骨摘出術（その他の腐骨摘出術）", "150461610"],
+  ["K051 1", "骨全摘術（肩甲骨全摘術）", "150023410"],
+  ["K051 2", "骨全摘術（上腕骨全摘術）", "150023510"],
+  ["K051 3", "骨全摘術（大腿骨全摘術）", "150023610"],
+  ["K051 4", "骨全摘術（前腕骨全摘術）", "150023710"],
+  ["K051 5", "骨全摘術（下腿骨全摘術）", "150023810"],
+  ["K051 6", "骨全摘術（鎖骨全摘術）", "150023910"],
+  ["K051 7", "骨全摘術（膝蓋骨全摘術）", "150024010"],
+  ["K051 8", "骨全摘術（手部骨全摘術）", "150024110"],
+  ["K051 9", "骨全摘術（足部骨全摘術）", "150461710"],
+  ["K051 10", "骨全摘術（その他の骨全摘術）", "150461810"],
+  ["K051-2 1", "中手骨摘除術（２本以上）", "150024550"],
+  ["K051-2 2", "中足骨摘除術（２本以上）", "150024650"],
+  ["K052 1", "骨腫瘍切除術（肩甲骨腫瘍切除術）", "150024710"],
+  ["K052 2", "骨腫瘍切除術（上腕骨腫瘍切除術）", "150024810"],
+  ["K052 3", "骨腫瘍切除術（大腿骨腫瘍切除術）", "150024910"],
+  ["K052 4", "骨腫瘍切除術（前腕骨腫瘍切除術）", "150025010"],
+  ["K052 5", "骨腫瘍切除術（下腿骨腫瘍切除術）", "150025110"],
+  ["K052 6", "骨腫瘍切除術（鎖骨腫瘍切除術）", "150025210"],
+  ["K052 7", "骨腫瘍切除術（膝蓋骨腫瘍切除術）", "150025310"],
+  ["K052 8", "骨腫瘍切除術（手根骨腫瘍切除術）", "150461910"],
+  ["K052 9", "骨腫瘍切除術（中手骨腫瘍切除術）", "150462010"],
+  ["K052 10", "骨腫瘍切除術（手指骨腫瘍切除術）", "150462110"],
+  ["K052 11", "骨腫瘍切除術（足根骨腫瘍切除術）", "150462210"],
+  ["K052 12", "骨腫瘍切除術（中足骨腫瘍切除術）", "150462310"],
+  ["K052 13", "骨腫瘍切除術（足趾骨腫瘍切除術）", "150462410"],
+  ["K052 14", "骨腫瘍切除術（その他の骨腫瘍切除術）", "150289510"],
+  ["K053 1", "骨悪性腫瘍手術（肩甲骨悪性腫瘍手術）", "150026510"],
+  ["K053 2", "骨悪性腫瘍手術（上腕骨悪性腫瘍手術）", "150026610"],
+  ["K053 3", "骨悪性腫瘍手術（大腿骨悪性腫瘍手術）", "150026710"],
+  ["K053 4", "骨悪性腫瘍手術（前腕骨悪性腫瘍手術）", "150026810"],
+  ["K053 5", "骨悪性腫瘍手術（下腿骨悪性腫瘍手術）", "150026910"],
+  ["K053 6", "骨悪性腫瘍手術（鎖骨悪性腫瘍手術）", "150027010"],
+  ["K053 7", "骨悪性腫瘍手術（膝蓋骨悪性腫瘍手術）", "150027110"],
+  ["K053 8", "骨悪性腫瘍手術（手部骨悪性腫瘍手術）", "150027210"],
+  ["K053 9", "骨悪性腫瘍手術（足部骨悪性腫瘍手術）", "150462510"],
+  ["K053 10", "骨悪性腫瘍手術（その他の骨悪性腫瘍手術）", "150462610"],
+  ["K053-2 1", "骨悪性腫瘍、類骨骨腫及び四肢軟部腫瘍ラジオ波焼灼療法（２センチメートル以内のもの）", "150445410"],
+  ["K053-2 2", "骨悪性腫瘍、類骨骨腫及び四肢軟部腫瘍ラジオ波焼灼療法（２センチメートルを超えるもの）", "150445510"],
+  ["K054 1", "骨切り術（肩甲骨骨切り術）", "150027510"],
+  ["K054 2", "骨切り術（上腕骨骨切り術）", "150027610"],
+  ["K054 3", "骨切り術（大腿骨骨切り術）", "150027710"],
+  ["K054 4", "骨切り術（前腕骨骨切り術）", "150027810"],
+  ["K054 5", "骨切り術（下腿骨骨切り術）", "150027910"],
+  ["K054 6", "骨切り術（鎖骨骨切り術）", "150028010"],
+  ["K054 7", "骨切り術（膝蓋骨骨切り術）", "150028110"],
+  ["K054 8", "骨切り術（手根骨骨切り術）", "150462910"],
+  ["K054 9", "骨切り術（中手骨骨切り術）", "150463010"],
+  ["K054 10", "骨切り術（手指骨骨切り術）", "150463110"],
+  ["K054 11", "骨切り術（足根骨骨切り術）", "150463210"],
+  ["K054 12", "骨切り術（中足骨骨切り術）", "150463310"],
+  ["K054 13", "骨切り術（足趾骨骨切り術）", "150463410"],
+  ["K054 14", "骨切り術（その他の骨切り術）", "150289710"],
+  ["K054-2", "脛骨近位骨切り術", "150425710"],
+  ["K054-3", "脛骨遠位骨切り術", "150463510"],
+  ["K055-2", "大腿骨頭回転骨切り術", "150308810"],
+  ["K055-3", "大腿骨近位部（転子間を含む。）骨切り術", "150308910"],
+  ["K055-4", "大腿骨遠位骨切り術", "150445710"],
+  ["K056 1", "偽関節手術（肩甲骨偽関節手術）", "150028610"],
+  ["K056 2", "偽関節手術（上腕骨偽関節手術）", "150028710"],
+  ["K056 3", "偽関節手術（大腿骨偽関節手術）", "150028810"],
+  ["K056 4", "偽関節手術（前腕骨偽関節手術）", "150028910"],
+  ["K056 5", "偽関節手術（下腿骨偽関節手術）", "150029010"],
+  ["K056 6", "偽関節手術（手舟状骨偽関節手術）", "150309010"],
+  ["K056 7", "偽関節手術（鎖骨偽関節手術）", "150029110"],
+  ["K056 8", "偽関節手術（膝蓋骨偽関節手術）", "150029210"],
+  ["K056 9", "偽関節手術（手根骨（舟状骨を除く。）偽関節手術）", "150463610"],
+  ["K056 10", "偽関節手術（中手骨偽関節手術）", "150463710"],
+  ["K056 11", "偽関節手術（手指骨偽関節手術）", "150463810"],
+  ["K056 12", "偽関節手術（足根骨偽関節手術）", "150463910"],
+  ["K056 13", "偽関節手術（中足骨偽関節手術）", "150464010"],
+  ["K056 14", "偽関節手術（足趾骨偽関節手術）", "150464110"],
+  ["K056 15", "偽関節手術（その他の偽関節手術）", "150289810"],
+  ["K056-2", "難治性感染性偽関節手術（創外固定器によるもの）", "150353010"],
+  ["K057 1", "変形治癒骨折矯正手術（肩甲骨変形治癒骨折矯正手術）", "150029610"],
+  ["K057 2", "変形治癒骨折矯正手術（上腕骨変形治癒骨折矯正手術）", "150029710"],
+  ["K057 3", "変形治癒骨折矯正手術（大腿骨変形治癒骨折矯正手術）", "150029810"],
+  ["K057 4", "変形治癒骨折矯正手術（前腕骨変形治癒骨折矯正手術）", "150029910"],
+  ["K057 5", "変形治癒骨折矯正手術（下腿骨変形治癒骨折矯正手術）", "150030010"],
+  ["K057 6", "変形治癒骨折矯正手術（鎖骨変形治癒骨折矯正手術）", "150030110"],
+  ["K057 7", "変形治癒骨折矯正手術（膝蓋骨変形治癒骨折矯正手術）", "150030210"],
+  ["K057 8", "変形治癒骨折矯正手術（手根骨変形治癒骨折矯正手術）", "150464210"],
+  ["K057 9", "変形治癒骨折矯正手術（中手骨変形治癒骨折矯正手術）", "150464310"],
+  ["K057 10", "変形治癒骨折矯正手術（手指骨変形治癒骨折矯正手術）", "150464410"],
+  ["K057 11", "変形治癒骨折矯正手術（足根骨変形治癒骨折矯正手術）", "150464510"],
+  ["K057 12", "変形治癒骨折矯正手術（中足骨変形治癒骨折矯正手術）", "150464610"],
+  ["K057 13", "変形治癒骨折矯正手術（足趾骨変形治癒骨折矯正手術）", "150464710"],
+  ["K057 14", "変形治癒骨折矯正手術（その他の変形治癒骨折矯正手術）", "150289910"],
+  ["K058 1", "骨長調整手術（骨端軟骨発育抑制術）", "150031410"],
+  ["K058 2", "骨長調整手術（骨短縮術）", "150031510"],
+  ["K058 3", "骨長調整手術（手指骨及び足趾骨骨延長術）", "150294910"],
+  ["K058 4", "骨長調整手術（その他の骨延長術）", "150031610"],
+  ["K059 1", "骨移植術（軟骨移植術を含む。）（自家骨移植）", "150295010"],
+  ["K059 2", "骨移植術（軟骨移植術を含む。）（同種骨移植）（生体）", "150031710"],
+  ["K059 3ｲ", "骨移植術（軟骨移植術を含む。）（同種骨移植）（非生体）（特殊なもの）", "150383710"],
+  ["K059 3ﾛ", "骨移植術（軟骨移植術を含む。）（同種骨移植）（非生体）（その他の場合）", "150383810"],
+  ["K059 3ｲ", "骨移植術（軟骨移植術を含む。）（自家骨移植と人工骨移植の併施）（特殊なもの）", "150464850"],
+  ["K059 3ﾛ", "骨移植術（軟骨移植術を含む。）（自家骨移植と人工骨移植の併施）（その他の場合）", "150464950"],
+  ["K059 3ｲ", "骨移植術（軟骨移植術を含む。）（非生体同種骨移植と人工骨移植の併施）（特殊なもの）", "150465050"],
+  ["K059 3ﾛ", "骨移植術（軟骨移植術を含む。）（非生体同種骨移植と人工骨移植の併施）（その他の場合）", "150465150"],
+  ["K059 4", "骨移植術（軟骨移植術を含む。）（自家培養軟骨移植術）", "150369450"],
+  ["K059-2", "自家骨軟骨移植術（関節鏡下）", "150353110"],
+  ["K059-3", "軟骨修復材移植術", "150453750"],
+  ["K059-4", "軟骨修復材移植術（関節鏡下）", "150453850"],
+  ["K060 1", "関節切開術（肩関節切開術）", "150031910"],
+  ["K060 2", "関節切開術（股関節切開術）", "150032010"],
+  ["K060 3", "関節切開術（膝関節切開術）", "150032110"],
+  ["K060 4", "関節切開術（胸鎖関節切開術）", "150032210"],
+  ["K060 5", "関節切開術（肘関節切開術）", "150032310"],
+  ["K060 6", "関節切開術（手関節切開術）", "150032410"],
+  ["K060 7", "関節切開術（足関節及び距骨周囲関節切開術）", "150032510"],
+  ["K060 8", "関節切開術（肩鎖関節切開術）", "150032610"],
+  ["K060 9", "関節切開術（手指関節切開術）", "150465210"],
+  ["K060 10", "関節切開術（足趾関節切開術）", "150465310"],
+  ["K060-2 1", "肩甲関節周囲沈着石灰摘出術", "150395910"],
+  ["K060-2 2", "肩甲関節周囲沈着石灰摘出術（関節鏡下）", "150396010"],
+  ["K060-3 1", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性肩関節炎掻爬術）", "150052850"],
+  ["K060-3 2", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性股関節炎掻爬術）", "150052950"],
+  ["K060-3 3", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性膝関節炎掻爬術）", "150053050"],
+  ["K060-3 4", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性胸鎖関節炎掻爬術）", "150309110"],
+  ["K060-3 5", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性肘関節炎掻爬術）", "150053150"],
+  ["K060-3 6", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性手関節炎掻爬術）", "150053250"],
+  ["K060-3 7", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性足関節及び距骨周囲関節炎掻爬術）", "150053350"],
+  ["K060-3 8", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性肩鎖関節炎掻爬術）", "150309210"],
+  ["K060-3 9", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性手指関節炎掻爬術）", "150465410"],
+  ["K060-3 10", "化膿性又は結核性関節炎掻爬術（化膿性又は結核性足趾関節炎掻爬術）", "150465510"],
+  ["K063 1", "関節脱臼観血的整復術（肩関節脱臼観血的整復術）", "150035210"],
+  ["K063 2", "関節脱臼観血的整復術（股関節脱臼観血的整復術）", "150035310"],
+  ["K063 3", "関節脱臼観血的整復術（膝関節脱臼観血的整復術）", "150035410"],
+  ["K063 4", "関節脱臼観血的整復術（胸鎖関節脱臼観血的整復術）", "150035510"],
+  ["K063 5", "関節脱臼観血的整復術（肘関節脱臼観血的整復術）", "150035610"],
+  ["K063 6", "関節脱臼観血的整復術（手関節脱臼観血的整復術）", "150035710"],
+  ["K063 7", "関節脱臼観血的整復術（足関節及び距骨周囲関節脱臼観血的整復術）", "150035810"],
+  ["K063 8", "関節脱臼観血的整復術（肩鎖関節脱臼観血的整復術）", "150035910"],
+  ["K063 9", "関節脱臼観血的整復術（手指関節脱臼観血的整復術）", "150465810"],
+  ["K063 10", "関節脱臼観血的整復術（足趾関節脱臼観血的整復術）", "150465910"],
+  ["K064", "先天性股関節脱臼観血的整復術", "150036110"],
+  ["K066 1", "関節滑膜切除術（肩関節滑膜切除術）", "150037110"],
+  ["K066 2", "関節滑膜切除術（股関節滑膜切除術）", "150037210"],
+  ["K066 3", "関節滑膜切除術（膝関節滑膜切除術）", "150037310"],
+  ["K066 4", "関節滑膜切除術（胸鎖関節滑膜切除術）", "150037410"],
+  ["K066 5", "関節滑膜切除術（肘関節滑膜切除術）", "150037510"],
+  ["K066 6", "関節滑膜切除術（手関節滑膜切除術）", "150037610"],
+  ["K066 7", "関節滑膜切除術（足関節及び距骨周囲関節滑膜切除術）", "150037710"],
+  ["K066 8", "関節滑膜切除術（肩鎖関節滑膜切除術）", "150037810"],
+  ["K066 9", "関節滑膜切除術（手指関節滑膜切除術）", "150466210"],
+  ["K066 10", "関節滑膜切除術（足趾関節滑膜切除術）", "150466310"],
+  ["K066 11", "関節滑膜切除術（掌指関節滑膜切除術）", "150466410"],
+  ["K066-2 1", "関節滑膜切除術（関節鏡下）（肩関節滑膜切除術）", "150310210"],
+  ["K066-2 2", "関節滑膜切除術（関節鏡下）（股関節滑膜切除術）", "150310310"],
+  ["K066-2 3", "関節滑膜切除術（関節鏡下）（膝関節滑膜切除術）", "150310410"],
+  ["K066-2 4", "関節滑膜切除術（関節鏡下）（胸鎖関節滑膜切除術）", "150310510"],
+  ["K066-2 5", "関節滑膜切除術（関節鏡下）（肘関節滑膜切除術）", "150310610"],
+  ["K066-2 6", "関節滑膜切除術（関節鏡下）（手関節滑膜切除術）", "150310710"],
+  ["K066-2 7", "関節滑膜切除術（関節鏡下）（足関節及び距骨周囲関節滑膜切除術）", "150310810"],
+  ["K066-2 8", "関節滑膜切除術（関節鏡下）（肩鎖関節滑膜切除術）", "150310910"],
+  ["K066-2 9", "関節滑膜切除術（関節鏡下）（手指関節滑膜切除術）", "150466510"],
+  ["K066-2 10", "関節滑膜切除術（関節鏡下）（足趾関節滑膜切除術）", "150466610"],
+  ["K066-2 11", "関節滑膜切除術（関節鏡下）（掌指関節滑膜切除術）", "150466710"],
+  ["K066-3 1", "関節滑液包摘出術（肩関節滑液包摘出術）", "150038150"],
+  ["K066-3 2", "関節滑液包摘出術（股関節滑液包摘出術）", "150038250"],
+  ["K066-3 3", "関節滑液包摘出術（膝関節滑液包摘出術）", "150038350"],
+  ["K066-3 4", "関節滑液包摘出術（肘関節滑液包摘出術）", "150038550"],
+  ["K066-3 5", "関節滑液包摘出術（手関節滑液包摘出術）", "150038650"],
+  ["K066-3 6", "関節滑液包摘出術（足関節及び距骨周囲関節滑液包摘出術）", "150038750"],
+  ["K066-4 1", "関節滑液包摘出術（関節鏡下）（肩関節滑液包摘出術）", "150311110"],
+  ["K066-4 2", "関節滑液包摘出術（関節鏡下）（股関節滑液包摘出術）", "150311210"],
+  ["K066-4 3", "関節滑液包摘出術（関節鏡下）（膝関節滑液包摘出術）", "150311310"],
+  ["K066-4 4", "関節滑液包摘出術（関節鏡下）（肘関節滑液包摘出術）", "150311510"],
+  ["K066-4 5", "関節滑液包摘出術（関節鏡下）（手関節滑液包摘出術）", "150311610"],
+  ["K066-4 6", "関節滑液包摘出術（関節鏡下）（足関節及び距骨周囲関節滑液包摘出術）", "150311710"],
+  ["K066-5", "膝蓋骨滑液包切除術", "150038050"],
+  ["K066-6", "膝蓋骨滑液包切除術（関節鏡下）", "150312010"],
+  ["K067 1", "関節鼠摘出手術（肩関節鼠摘出手術）", "150039110"],
+  ["K067 2", "関節鼠摘出手術（股関節鼠摘出手術）", "150039210"],
+  ["K067 3", "関節鼠摘出手術（膝関節鼠摘出手術）", "150039310"],
+  ["K067 4", "関節鼠摘出手術（肘関節鼠摘出手術）", "150039510"],
+  ["K067 5", "関節鼠摘出手術（手関節鼠摘出手術）", "150039610"],
+  ["K067 6", "関節鼠摘出手術（足関節及び距骨周囲関節鼠摘出手術）", "150039710"],
+  ["K067-2 1", "関節鼠摘出手術（関節鏡下）（肩関節鼠摘出手術）", "150312210"],
+  ["K067-2 2", "関節鼠摘出手術（関節鏡下）（股関節鼠摘出手術）", "150312310"],
+  ["K067-2 3", "関節鼠摘出手術（関節鏡下）（膝関節鼠摘出手術）", "150312410"],
+  ["K067-2 4", "関節鼠摘出手術（関節鏡下）（肘関節鼠摘出手術）", "150312610"],
+  ["K067-2 5", "関節鼠摘出手術（関節鏡下）（手関節鼠摘出手術）", "150312710"],
+  ["K067-2 6", "関節鼠摘出手術（関節鏡下）（足関節及び距骨周囲関節鼠摘出手術）", "150312810"],
+  ["K067-2 7", "関節鼠摘出手術（関節鏡下）（手指関節鼠摘出手術）", "150466810"],
+  ["K067-2 8", "関節鼠摘出手術（関節鏡下）（足趾関節鼠摘出手術）", "150466910"],
+  ["K068", "半月板切除術", "150040910"],
+  ["K068-2", "半月板切除術（関節鏡下）", "150313110"],
+  ["K069", "半月板縫合術", "150261910"],
+  ["K069-3", "半月板縫合術（関節鏡下）", "150313210"],
+  ["K069-4", "半月板制動術（関節鏡下）", "150445810"],
+  ["K072 1", "関節切除術（肩関節切除術）", "150041710"],
+  ["K072 2", "関節切除術（股関節切除術）", "150041810"],
+  ["K072 3", "関節切除術（膝関節切除術）", "150041910"],
+  ["K072 4", "関節切除術（胸鎖関節切除術）", "150042010"],
+  ["K072 5", "関節切除術（肘関節切除術）", "150042110"],
+  ["K072 6", "関節切除術（手関節切除術）", "150042210"],
+  ["K072 7", "関節切除術（足関節及び距骨周囲関節切除術）", "150042310"],
+  ["K072 8", "関節切除術（肩鎖関節切除術）", "150042410"],
+  ["K072 9", "関節切除術（手指関節切除術）", "150467210"],
+  ["K072 10", "関節切除術（足趾関節切除術）", "150467310"],
+  ["K073 1", "関節内骨折観血的手術（肩関節内骨折観血的手術）", "150042610"],
+  ["K073 2", "関節内骨折観血的手術（股関節内骨折観血的手術）", "150042710"],
+  ["K073 3", "関節内骨折観血的手術（膝関節内骨折観血的手術）", "150042810"],
+  ["K073 4", "関節内骨折観血的手術（肘関節内骨折観血的手術）", "150043010"],
+  ["K073 5", "関節内骨折観血的手術（胸鎖関節内骨折観血的手術）", "150042910"],
+  ["K073 6", "関節内骨折観血的手術（手関節内骨折観血的手術）", "150043110"],
+  ["K073 7", "関節内骨折観血的手術（足関節及び距骨周囲関節内骨折観血的手術）", "150043210"],
+  ["K073 8", "関節内骨折観血的手術（肩鎖関節内骨折観血的手術）", "150043310"],
+  ["K073 9", "関節内骨折観血的手術（手指関節内骨折観血的手術）", "150467410"],
+  ["K073 10", "関節内骨折観血的手術（足趾関節内骨折観血的手術）", "150467510"],
+  ["K073-2 1", "関節内骨折観血的手術（関節鏡下）（肩関節内骨折観血的手術）", "150353210"],
+  ["K073-2 2", "関節内骨折観血的手術（関節鏡下）（股関節内骨折観血的手術）", "150353310"],
+  ["K073-2 3", "関節内骨折観血的手術（関節鏡下）（膝関節内骨折観血的手術）", "150353410"],
+  ["K073-2 4", "関節内骨折観血的手術（関節鏡下）（肘関節内骨折観血的手術）", "150353610"],
+  ["K073-2 5", "関節内骨折観血的手術（関節鏡下）（胸鎖関節内骨折観血的手術）", "150353510"],
+  ["K073-2 6", "関節内骨折観血的手術（関節鏡下）（手関節内骨折観血的手術）", "150353710"],
+  ["K073-2 7", "関節内骨折観血的手術（関節鏡下）（足関節及び距骨周囲関節内骨折観血的手術）", "150353810"],
+  ["K073-2 8", "関節内骨折観血的手術（関節鏡下）（肩鎖関節内骨折観血的手術）", "150353910"],
+  ["K073-2 9", "関節内骨折観血的手術（関節鏡下）（手指関節内骨折観血的手術）", "150467610"],
+  ["K073-2 10", "関節内骨折観血的手術（関節鏡下）（足趾関節内骨折観血的手術）", "150467710"],
+  ["K074 1", "靱帯断裂縫合術（十字靱帯断裂縫合術）", "150043510"],
+  ["K074 2", "靱帯断裂縫合術（膝側副靱帯断裂縫合術）", "150043610"],
+  ["K074 3", "靱帯断裂縫合術（手指靱帯断裂縫合術）", "150467810"],
+  ["K074 4", "靱帯断裂縫合術（足趾靱帯断裂縫合術）", "150467910"],
+  ["K074 5", "靱帯断裂縫合術（その他の靱帯断裂縫合術）", "150290010"],
+  ["K074-2 1", "靱帯断裂縫合術（関節鏡下）（十字靱帯断裂縫合術）", "150313310"],
+  ["K074-2 2", "靱帯断裂縫合術（関節鏡下）（膝側副靱帯断裂縫合術）", "150313410"],
+  ["K074-2 3", "靱帯断裂縫合術（関節鏡下）（三角線維軟骨複合体縫合術）", "150468010"],
+  ["K074-2 4", "靱帯断裂縫合術（関節鏡下）（その他の靱帯断裂縫合術）", "150313610"],
+  ["K074-3", "三角線維軟骨複合体切除術（関節鏡下）", "150468110"],
+  ["K076 1", "関節観血的授動術（肩関節観血的授動術）", "150045210"],
+  ["K076 2", "関節観血的授動術（股関節観血的授動術）", "150045310"],
+  ["K076 3", "関節観血的授動術（膝関節観血的授動術）", "150045410"],
+  ["K076 4", "関節観血的授動術（肘関節観血的授動術）", "150045610"],
+  ["K076 5", "関節観血的授動術（手関節観血的授動術）", "150045710"],
+  ["K076 6", "関節観血的授動術（足関節及び距骨周囲関節観血的授動術）", "150045810"],
+  ["K076 7", "関節観血的授動術（手指関節観血的授動術）", "150468410"],
+  ["K076 8", "関節観血的授動術（足趾関節観血的授動術）", "150468510"],
+  ["K076-2 1", "関節授動術（関節鏡下）（肩関節授動術）", "150396110"],
+  ["K076-2 2", "関節授動術（関節鏡下）（股関節授動術）", "150396210"],
+  ["K076-2 3", "関節授動術（関節鏡下）（膝関節授動術）", "150396310"],
+  ["K076-2 4", "関節授動術（関節鏡下）（肘関節授動術）", "150396510"],
+  ["K076-2 5", "関節授動術（関節鏡下）（手関節授動術）", "150396610"],
+  ["K076-2 6", "関節授動術（関節鏡下）（足関節及び距骨周囲関節授動術）", "150396710"],
+  ["K076-2 7", "関節授動術（関節鏡下）（手指関節授動術）", "150396910"],
+  ["K076-3", "肩関節授動術（関節鏡下）（肩腱板断裂手術を伴うもの）", "150445910"],
+  ["K077 1", "関節観血的制動術（肩関節観血的制動術）", "150046110"],
+  ["K077 2", "関節観血的制動術（股関節観血的制動術）", "150046210"],
+  ["K077 3", "関節観血的制動術（膝関節観血的制動術）", "150046310"],
+  ["K077 4", "関節観血的制動術（胸鎖関節観血的制動術）", "150046410"],
+  ["K077 5", "関節観血的制動術（肘関節観血的制動術）", "150046510"],
+  ["K077 6", "関節観血的制動術（手関節観血的制動術）", "150046610"],
+  ["K077 7", "関節観血的制動術（足関節及び距骨周囲関節観血的制動術）", "150046710"],
+  ["K077 8", "関節観血的制動術（肩鎖関節観血的制動術）", "150046810"],
+  ["K077 9", "関節観血的制動術（手指関節観血的制動術）", "150468610"],
+  ["K077 10", "関節観血的制動術（足趾関節観血的制動術）", "150468710"],
+  ["K077-2", "肩甲骨烏口突起移行術", "150446010"],
+  ["K078 1", "関節観血的固定術（肩関節観血的固定術）", "150047010"],
+  ["K078 2", "関節観血的固定術（股関節観血的固定術）", "150047110"],
+  ["K078 3", "関節観血的固定術（膝関節観血的固定術）", "150047210"],
+  ["K078 4", "関節観血的固定術（胸鎖関節観血的固定術）", "150047310"],
+  ["K078 5", "関節観血的固定術（肘関節観血的固定術）", "150047410"],
+  ["K078 6", "関節観血的固定術（手関節観血的固定術）", "150047510"],
+  ["K078 7", "関節観血的固定術（足関節及び距骨周囲関節観血的固定術）", "150047610"],
+  ["K078 8", "関節観血的固定術（肩鎖関節観血的固定術）", "150047710"],
+  ["K078 9", "関節観血的固定術（手指関節観血的固定術）", "150468810"],
+  ["K078 10", "関節観血的固定術（足趾関節観血的固定術）", "150468910"],
+  ["K079 1", "靱帯断裂形成手術（十字靱帯断裂形成手術）", "150047910"],
+  ["K079 2", "靱帯断裂形成手術（膝側副靱帯断裂形成手術）", "150048010"],
+  ["K079 3", "靱帯断裂形成手術（手指靱帯断裂形成手術）", "150469010"],
+  ["K079 4", "靱帯断裂形成手術（足趾靱帯断裂形成手術）", "150469110"],
+  ["K079 5", "靱帯断裂形成手術（その他の靱帯断裂形成手術）", "150290210"],
+  ["K079-2 1", "靱帯断裂形成手術（関節鏡下）（十字靱帯断裂形成手術）", "150313710"],
+  ["K079-2 2", "靱帯断裂形成手術（関節鏡下）（膝側副靱帯断裂形成手術）", "150313810"],
+  ["K079-2 3", "靱帯断裂形成手術（関節鏡下）（内側膝蓋大腿靱帯断裂形成手術）", "150354110"],
+  ["K079-2 4", "靱帯断裂形成手術（関節鏡下）（手指靱帯断裂形成手術）", "150469210"],
+  ["K079-2 5", "靱帯断裂形成手術（関節鏡下）（足趾靱帯断裂形成手術）", "150469310"],
+  ["K079-2 6", "靱帯断裂形成手術（関節鏡下）（その他の靱帯断裂形成手術）", "150314010"],
+  ["K080 1", "関節形成手術（肩関節形成手術）", "150048210"],
+  ["K080 2", "関節形成手術（股関節形成手術）", "150048310"],
+  ["K080 3", "関節形成手術（膝関節形成手術）", "150048410"],
+  ["K080 4", "関節形成手術（胸鎖関節形成手術）", "150048510"],
+  ["K080 5", "関節形成手術（肘関節形成手術）", "150048610"],
+  ["K080 6", "関節形成手術（手関節形成手術）", "150048710"],
+  ["K080 7", "関節形成手術（足関節及び距骨周囲関節形成手術）", "150048810"],
+  ["K080 8", "関節形成手術（肩鎖関節形成手術）", "150048910"],
+  ["K080 9", "関節形成手術（手指関節形成手術）", "150469410"],
+  ["K080 10", "関節形成手術（足趾関節形成手術）", "150469510"],
+  ["K080-2", "内反足手術", "150049250"],
+  ["K080-3 1", "肩腱板断裂手術（簡単なもの）", "150343710"],
+  ["K080-3 2", "肩腱板断裂手術（複雑なもの）", "150354210"],
+  ["K080-4 1", "肩腱板断裂手術（関節鏡下）（簡単なもの）", "150343810"],
+  ["K080-4 2", "肩腱板断裂手術（関節鏡下）（簡単なもの）（上腕二頭筋腱の固定を伴うもの）", "150425810"],
+  ["K080-4 3", "肩腱板断裂手術（関節鏡下）（複雑なもの）", "150354310"],
+  ["K080-5 1", "肩関節唇形成術（関節鏡下）（腱板断裂を伴うもの）", "150384210"],
+  ["K080-5 2", "肩関節唇形成術（関節鏡下）（腱板断裂を伴わないもの）", "150384310"],
+  ["K080-5 3", "肩関節唇形成術（関節鏡下）（肩甲骨烏口突起移行術を伴うもの）", "150446110"],
+  ["K080-6", "股関節唇縫合術（関節鏡下）", "150384410"],
+  ["K080-7 1", "上腕二頭筋腱固定術", "150425910"],
+  ["K080-7 2", "上腕二頭筋腱固定術（関節鏡下）", "150426010"],
+  ["K081 1", "人工骨頭挿入術（肩関節人工骨頭挿入術）", "150049410"],
+  ["K081 2", "人工骨頭挿入術（股関節人工骨頭挿入術）", "150049510"],
+  ["K081 3", "人工骨頭挿入術（肘関節人工骨頭挿入術）", "150049810"],
+  ["K082 1ｲ", "人工関節置換術（人工肩関節置換術）（腱移行を伴わないもの）", "150469610"],
+  ["K082 1ﾛ", "人工関節置換術（人工肩関節置換術）（腱移行を伴うもの）", "150469710"],
+  ["K082 2", "人工関節置換術（人工股関節置換術）", "150050410"],
+  ["K082 3", "人工関節置換術（人工膝関節置換術）", "150050510"],
+  ["K082 4", "人工関節置換術（人工肘関節置換術）", "150050710"],
+  ["K082 5", "人工関節置換術（人工手関節置換術）", "150050810"],
+  ["K082 6", "人工関節置換術（人工足関節置換術）", "150050910"],
+  ["K082 7", "人工関節置換術（人工手指関節置換術）", "150469810"],
+  ["K082 8", "人工関節置換術（人工足趾関節置換術）", "150469910"],
+  ["K082-2 1", "人工関節抜去術（人工肩関節抜去術）", "150300210"],
+  ["K082-2 2", "人工関節抜去術（人工股関節抜去術）", "150300310"],
+  ["K082-2 3", "人工関節抜去術（人工膝関節抜去術）", "150300410"],
+  ["K082-2 4", "人工関節抜去術（人工肘関節抜去術）", "150300610"],
+  ["K082-2 5", "人工関節抜去術（人工手関節抜去術）", "150300710"],
+  ["K082-2 6", "人工関節抜去術（人工足関節抜去術）", "150300810"],
+  ["K082-2 7", "人工関節抜去術（人工手指関節抜去術）", "150470010"],
+  ["K082-2 8", "人工関節抜去術（人工足趾関節抜去術）", "150470110"],
+  ["K082-3 1", "人工関節再置換術（人工肩関節再置換術）", "150255910"],
+  ["K082-3 2", "人工関節再置換術（人工股関節再置換術）", "150256010"],
+  ["K082-3 3", "人工関節再置換術（人工膝関節再置換術）", "150256110"],
+  ["K082-3 4", "人工関節再置換術（人工肘関節再置換術）", "150256310"],
+  ["K082-3 5", "人工関節再置換術（人工手関節再置換術）", "150256410"],
+  ["K082-3 6", "人工関節再置換術（人工足関節再置換術）", "150256510"],
+  ["K082-3 7", "人工関節再置換術（人工手指関節再置換術）", "150470210"],
+  ["K082-3 8", "人工関節再置換術（人工足趾関節再置換術）", "150470310"],
+  ["K082-4", "関節形成術（自家肋骨肋軟骨を用いるもの）", "150397010"],
+  ["K082-5", "人工距骨全置換術", "150411610"],
+  ["K082-6", "人工股関節摺動面交換術", "150411710"],
+  ["K082-7", "人工股関節置換術（手術支援装置を用いるもの）", "150446210"],
+  ["K082-8", "人工膝関節置換術（手術支援装置を用いるもの）", "150470410"],
+  ["K084 1", "四肢切断術（上腕切断術）", "150051310"],
+  ["K084 2", "四肢切断術（前腕切断術）", "150051410"],
+  ["K084 3", "四肢切断術（手切断術）", "150051510"],
+  ["K084 4", "四肢切断術（大腿切断術）", "150051610"],
+  ["K084 5", "四肢切断術（下腿切断術）", "150051710"],
+  ["K084 6", "四肢切断術（足切断術）", "150051810"],
+  ["K084-2", "肩甲帯離断術", "150052050"],
+  ["K085 1", "四肢関節離断術（肩関節離断術）", "150052110"],
+  ["K085 2", "四肢関節離断術（股関節離断術）", "150052210"],
+  ["K085 3", "四肢関節離断術（膝関節離断術）", "150052310"],
+  ["K085 4", "四肢関節離断術（肘関節離断術）", "150052410"],
+  ["K085 5", "四肢関節離断術（手関節離断術）", "150052510"],
+  ["K085 6", "四肢関節離断術（足関節及び距骨周囲関節離断術）", "150052610"],
+  ["K085 7", "四肢関節離断術（手指関節離断術）", "150470510"],
+  ["K085 8", "四肢関節離断術（足趾関節離断術）", "150470610"],
+  ["K086 1", "断端形成術（軟部形成のみのもの）（手指断端形成術）", "150470710"],
+  ["K086 2", "断端形成術（軟部形成のみのもの）（足趾断端形成術）", "150471010"],
+  ["K086 3", "断端形成術（軟部形成のみのもの）（その他の断端形成術）", "150053610"],
+  ["K087 1", "断端形成術（骨形成を要するもの）（手指断端形成術）", "150470910"],
+  ["K087 2", "断端形成術（骨形成を要するもの）（足趾断端形成術）", "150471010"],
+  ["K087 3", "断端形成術（骨形成を要するもの）（その他の断端形成術）", "150053810"],
+  ["K088 1", "四肢切断再接合術", "150053910"],
+  ["K088 2", "四肢切断再接合術（手指切断再接合術）", "150471110"],
+  ["K088 3", "四肢切断再接合術（足趾切断再接合術）", "150471210"],
+  ["K093", "手根管開放手術", "150055110"],
+  ["K093-2", "手根管開放手術（内視鏡下）", "150314110"],
+  ["K094", "足三関節固定（ランブリヌディ）手術", "150055410"],
+  ["K096 1", "手掌、足底腱膜切離・切除術（手掌腱膜切離・切除術）", "150471310"],
+  ["K096 2", "手掌、足底腱膜切離・切除術（足底腱膜切離・切除術）", "150471410"],
+  ["K096 3", "手掌、足底腱膜切離・切除術（足底腱膜切離・切除術（関節鏡下））", "150354510"],
+  ["K097", "手掌、足底異物摘出術（手掌異物摘出術）", "150055710"],
+  ["K097", "手掌、足底異物摘出術（足底異物摘出術）", "150055810"],
+  ["K099", "手指及び足趾瘢痕拘縮手術", "150056010"],
+  ["K099-2 1", "デュプイトレン拘縮手術（１指）", "150290710"],
+  ["K099-2 2", "デュプイトレン拘縮手術（２指から３指）", "150290810"],
+  ["K099-2 3", "デュプイトレン拘縮手術（４指以上）", "150290910"],
+  ["K100 1", "多指症手術（軟部形成のみのもの）", "150056210"],
+  ["K100 2", "多指症手術（骨関節、腱の形成を要するもの）", "150056310"],
+  ["K101 1", "合指症手術（軟部形成のみのもの）", "150056510"],
+  ["K101 2", "合指症手術（骨関節、腱の形成を要するもの）", "150056610"],
+  ["K101-2 1", "指癒着症手術（軟部形成のみのもの）", "150056850"],
+  ["K101-2 2", "指癒着症手術（骨関節、腱の形成を要するもの）", "150056950"],
+  ["K102 1", "巨指症手術（軟部形成のみのもの）", "150057110"],
+  ["K102 2", "巨指症手術（骨関節、腱の形成を要するもの）", "150057210"],
+  ["K103 1ｲ", "屈指症手術、斜指症手術（屈指症手術（軟部形成のみのもの））", "150057410"],
+  ["K103 1ﾛ", "屈指症手術、斜指症手術（屈指症手術（骨関節、腱の形成を要するもの））", "150057510"],
+  ["K103 2ｲ", "屈指症手術、斜指症手術（斜指症手術（軟部形成のみのもの））", "150057710"],
+  ["K103 2ﾛ", "屈指症手術、斜指症手術（斜指症手術（骨関節、腱の形成を要するもの））", "150057810"],
+  ["K105 1", "裂手手術", "150058010"],
+  ["K105 2", "裂足手術", "150058110"],
+  ["K106", "母指化手術", "150058210"],
+  ["K107", "指移植手術", "150058310"],
+  ["K108", "母指対立再建術", "150058410"],
+  ["K109 1", "神経血管柄付皮弁術（手、足）（手部神経血管柄付皮弁術）", "150058510"],
+  ["K109 2", "神経血管柄付皮弁術（手、足）（足部神経血管柄付皮弁術）", "150251810"],
+  ["K110", "第四足趾短縮症手術", "150058610"],
+  ["K110-2", "第一足趾外反症矯正手術", "150058710"],
+  ["K112", "腸骨窩膿瘍切開術", "150058810"],
+  ["K113", "腸骨窩膿瘍掻爬術", "150058910"],
+  ["K116 1", "脊椎、骨盤骨掻爬術（脊椎骨掻爬術）", "150059310"],
+  ["K116 2", "脊椎、骨盤骨掻爬術（骨盤骨掻爬術）", "150059410"],
+  ["K118", "脊椎脱臼観血的手術", "150059810"],
+  ["K119", "仙腸関節脱臼観血的手術", "150060210"],
+  ["K120", "恥骨結合離開観血的手術", "150060310"],
+  ["K124", "腸骨翼骨折観血的手術", "150060810"],
+  ["K124-2", "寛骨臼骨折観血的手術", "150384510"],
+  ["K125", "骨盤骨折観血的手術（腸骨翼骨折観血的手術及び寛骨臼骨折観血的手術を除く。）", "150060910"],
+  ["K126-2", "自家培養軟骨組織採取術", "150369550"],
+  ["K128 1", "脊椎、骨盤内異物（挿入物を含む。）除去術（脊椎内異物除去術）", "150061810"],
+  ["K128 2", "脊椎、骨盤内異物（挿入物を含む。）除去術（骨盤内異物除去術）", "150061910"],
+  ["K131-2 1", "椎弓切除術（内視鏡下）（頸椎椎弓切除術）", "150471510"],
+  ["K131-2 2", "椎弓切除術（内視鏡下）（胸椎椎弓切除術）", "150471610"],
+  ["K131-2 3", "椎弓切除術（内視鏡下）（腰椎椎弓切除術）", "150471710"],
+  ["K131-2 4", "椎弓切除術（内視鏡下）（仙椎椎弓切除術）", "150471810"],
+  ["K133 1", "黄色靱帯骨化症手術（頸椎黄色靱帯骨化症手術）", "150472010"],
+  ["K133 2", "黄色靱帯骨化症手術（胸椎黄色靱帯骨化症手術）", "150472110"],
+  ["K133 3", "黄色靱帯骨化症手術（腰椎黄色靱帯骨化症手術）", "150472210"],
+  ["K133 4", "黄色靱帯骨化症手術（仙椎黄色靱帯骨化症手術）", "150472310"],
+  ["K133-2 1", "後縦靱帯骨化症手術（前方進入によるもの）（頸椎後縦靱帯骨化症手術）", "150472410"],
+  ["K133-2 2", "後縦靱帯骨化症手術（前方進入によるもの）（胸椎後縦靱帯骨化症手術）", "150472510"],
+  ["K134 1", "椎間板摘出術（頸椎椎間板前方摘出術）", "150472610"],
+  ["K134 2", "椎間板摘出術（胸椎椎間板前方摘出術）", "150472710"],
+  ["K134 3", "椎間板摘出術（腰椎椎間板前方摘出術）", "150472810"],
+  ["K134 4", "椎間板摘出術（頸椎椎間板後方摘出術）", "150472910"],
+  ["K134 5", "椎間板摘出術（胸椎椎間板後方摘出術）", "150473010"],
+  ["K134 6", "椎間板摘出術（腰椎椎間板後方摘出術）", "150473110"],
+  ["K134 7", "椎間板摘出術（仙椎椎間板後方摘出術）", "150473210"],
+  ["K134 8", "椎間板摘出術（腰椎椎間板側方摘出術）", "150063310"],
+  ["K134 9", "椎間板摘出術（腰椎椎間板経皮的髄核摘出術）", "150273310"],
+  ["K134-2 1", "椎間板摘出（切除）術（内視鏡下）（頸椎椎間板前方摘出術）", "150473410"],
+  ["K134-2 2", "椎間板摘出（切除）術（内視鏡下）（胸椎椎間板前方摘出術）", "150473510"],
+  ["K134-2 3", "椎間板摘出（切除）術（内視鏡下）（腰椎椎間板前方摘出術）", "150473610"],
+  ["K134-2 4", "椎間板摘出（切除）術（内視鏡下）（頸椎椎間板後方摘出術）", "150473710"],
+  ["K134-2 5", "椎間板摘出（切除）術（内視鏡下）（胸椎椎間板後方摘出術）", "150473810"],
+  ["K134-2 6", "椎間板摘出（切除）術（内視鏡下）（腰椎椎間板後方摘出術）", "150473910"],
+  ["K134-2 7", "椎間板摘出（切除）術（内視鏡下）（仙椎椎間板後方摘出術）", "150474010"],
+  ["K134-3", "頸椎人工椎間板置換術", "150410650"],
+  ["K134-4", "椎間板内酵素注入療法", "150411810"],
+  ["K135 1", "脊椎、骨盤腫瘍切除術（頸椎腫瘍切除術）", "150474210"],
+  ["K135 2", "脊椎、骨盤腫瘍切除術（胸椎腫瘍切除術）", "150474310"],
+  ["K135 3", "脊椎、骨盤腫瘍切除術（腰椎腫瘍切除術）", "150474410"],
+  ["K135 4", "脊椎、骨盤腫瘍切除術（仙椎腫瘍切除術）", "150474510"],
+  ["K135 5", "脊椎、骨盤腫瘍切除術（骨盤腫瘍切除術）", "150063810"],
+  ["K136 1", "脊椎、骨盤悪性腫瘍手術（頸椎悪性腫瘍手術）", "150474710"],
+  ["K136 2", "脊椎、骨盤悪性腫瘍手術（胸椎悪性腫瘍手術）", "150474810"],
+  ["K136 3", "脊椎、骨盤悪性腫瘍手術（腰椎悪性腫瘍手術）", "150474910"],
+  ["K136 4", "脊椎、骨盤悪性腫瘍手術（仙椎悪性腫瘍手術）", "150475010"],
+  ["K136 5", "脊椎、骨盤悪性腫瘍手術（骨盤悪性腫瘍手術）", "150064010"],
+  ["K136-2 1", "腫瘍脊椎骨全摘術（頸椎腫瘍脊椎骨全摘術）", "150475210"],
+  ["K136-2 2", "腫瘍脊椎骨全摘術（胸椎腫瘍脊椎骨全摘術）", "150475310"],
+  ["K136-2 3", "腫瘍脊椎骨全摘術（腰椎腫瘍脊椎骨全摘術）", "150475410"],
+  ["K136-2 4", "腫瘍脊椎骨全摘術（仙椎腫瘍脊椎骨全摘術）", "150475510"],
+  ["K137", "骨盤切断術", "150064210"],
+  ["K138 1", "脊椎披裂手術（神経処置を伴うもの）", "150064410"],
+  ["K138 2", "脊椎披裂手術（その他のもの）", "150064510"],
+  ["K139 1", "脊椎骨切り術（頸椎骨切り術）", "150475610"],
+  ["K139 2", "脊椎骨切り術（胸椎骨切り術）", "150475710"],
+  ["K139 3", "脊椎骨切り術（腰椎骨切り術）", "150475810"],
+  ["K139 4", "脊椎骨切り術（仙椎骨切り術）", "150475910"],
+  ["K140", "骨盤骨切り術", "150064710"],
+  ["K141", "臼蓋形成手術", "150064810"],
+  ["K141-2", "寛骨臼移動術", "150314510"],
+  ["K141-3", "脊椎制動術", "150354910"],
+  ["K142 1", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（頸椎前方椎体固定術）", "150476010"],
+  ["K142 2", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（胸椎前方椎体固定術）", "150476110"],
+  ["K142 3", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（腰椎前方椎体固定術）", "150476210"],
+  ["K142 4", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（仙椎前方椎体固定術）", "150476310"],
+  ["K142 5", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（頸椎後方又は後側方固定術）", "150476410"],
+  ["K142 6", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（胸椎後方又は後側方固定術）", "150476510"],
+  ["K142 7", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（腰椎後方又は後側方固定術）", "150476610"],
+  ["K142 8", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（仙椎後方又は後側方固定術）", "150476710"],
+  ["K142 9", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（頸椎後方椎体固定術）", "150476810"],
+  ["K142 10", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（胸椎後方椎体固定術）", "150476910"],
+  ["K142 11", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（腰椎後方椎体固定術）", "150477010"],
+  ["K142 12", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（仙椎後方椎体固定術）", "150477110"],
+  ["K142 13", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（頸椎前方後方同時固定術）", "150477210"],
+  ["K142 14", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（胸椎前方後方同時固定術）", "150477310"],
+  ["K142 15", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（腰椎前方後方同時固定術）", "150477410"],
+  ["K142 16", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（仙椎前方後方同時固定術）", "150477510"],
+  ["K142 17", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（頸椎椎弓切除術）", "150477610"],
+  ["K142 18", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（胸椎椎弓切除術）", "150477710"],
+  ["K142 19", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（腰椎椎弓切除術）", "150477810"],
+  ["K142 20", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（仙椎椎弓切除術）", "150477910"],
+  ["K142 21", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（頸椎椎弓形成術）", "150478010"],
+  ["K142 22", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（胸椎椎弓形成術）", "150478110"],
+  ["K142 23", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（腰椎椎弓形成術）", "150478210"],
+  ["K142 24", "脊椎固定術、椎弓切除術、椎弓形成術（多椎間又は多椎弓の場合を含む。）（仙椎椎弓形成術）", "150478310"],
+  ["K142-2 1", "脊椎側彎症手術（脊椎側彎症固定術）", "150282750"],
+  ["K142-2 2ｲ", "脊椎側彎症手術（脊椎側彎症矯正術）（初回挿入）", "150343910"],
+  ["K142-2 2ﾛ", "脊椎側彎症手術（脊椎側彎症矯正術）（交換術）", "150344010"],
+  ["K142-2 2ﾛ", "脊椎側彎症手術（脊椎側彎症矯正術）（交換術）（胸郭変形矯正用材料を用いた場合）", "150344250"],
+  ["K142-2 2ﾊ", "脊椎側彎症手術（脊椎側彎症矯正術）（伸展術）", "150344110"],
+  ["K142-3 1", "胸椎又は腰椎前方固定術（内視鏡下）（胸椎前方固定術）", "150480810"],
+  ["K142-3 2", "胸椎又は腰椎前方固定術（内視鏡下）（腰椎前方固定術）", "150480910"],
+  ["K142-4", "経皮的椎体形成術", "150355210"],
+  ["K142-5 1", "椎弓形成術（内視鏡下）（頸椎椎弓形成術）", "150481110"],
+  ["K142-5 2", "椎弓形成術（内視鏡下）（胸椎椎弓形成術）", "150481210"],
+  ["K142-5 3", "椎弓形成術（内視鏡下）（腰椎椎弓形成術）", "150481310"],
+  ["K142-5 4", "椎弓形成術（内視鏡下）（仙椎椎弓形成術）", "150481410"],
+  ["K142-6", "歯突起骨折骨接合術", "150397310"],
+  ["K142-7", "腰椎分離部修復術", "150397410"],
+  ["K142-8", "腰部脊柱管拡大減圧術（顕微鏡下）", "150426110"],
+  ["K142-9", "腰椎後方椎体固定術（内視鏡下）", "150481610"],
+  ["K143", "仙腸関節固定術", "150066110"],
+  ["K144", "体外式脊椎固定術", "150243210"],
+  ["K149-2", "後頭蓋窩減圧術", "150397510"],
+  ["K179", "髄液漏閉鎖術", "150072010"],
+  ["K182 1", "神経縫合術（指（手、足））", "150273610"],
+  ["K182 2", "神経縫合術（その他のもの）", "150072310"],
+  ["K182-2 1", "神経交差縫合術（指（手、足））", "150315110"],
+  ["K182-2 2", "神経交差縫合術（その他のもの）", "150315210"],
+  ["K182-3 1", "神経再生誘導術（指（手、足））", "150397710"],
+  ["K182-3 2", "神経再生誘導術（その他のもの）", "150397810"],
+  ["K183", "脊髄硬膜切開術", "150072510"],
+  ["K183-2", "空洞・くも膜下腔シャント術（脊髄空洞症に対するもの）", "150372610"],
+  ["K184", "減圧脊髄切開術", "150072610"],
+  ["K185", "脊髄切截術", "150072710"],
+  ["K186", "脊髄硬膜内神経切断術", "150072810"],
+  ["K188 1", "神経剥離術（鏡視下によるもの）", "150355710"],
+  ["K188 2", "神経剥離術（その他のもの）", "150073110"],
+  ["K188-2", "硬膜外腔癒着剥離術", "150397910"],
+  ["K189", "脊髄ドレナージ術", "150244010"],
+  ["K190 1", "脊髄刺激装置植込術（脊髄刺激電極を留置した場合）", "150398010"],
+  ["K190 2", "脊髄刺激装置植込術（ジェネレーターを留置した場合）", "150398110"],
+  ["K190-2", "脊髄刺激装置交換術", "150398210"],
+  ["K190-3", "重症痙性麻痺治療薬髄腔内持続注入用植込型ポンプ設置術", "150315310"],
+  ["K190-4", "重症痙性麻痺治療薬髄腔内持続注入用植込型ポンプ交換術", "150315410"],
+  ["K190-5", "重症痙性麻痺治療薬髄腔内持続注入用植込型ポンプ薬剤再充填", "150315510"],
+  ["K191 1", "脊髄腫瘍摘出術（髄外のもの）", "150073210"],
+  ["K191 2", "脊髄腫瘍摘出術（髄内のもの）", "150073310"],
+  ["K192", "脊髄血管腫摘出術", "150073410"],
+  ["K193 1", "神経腫切除術（指（手、足））", "150273710"],
+  ["K193 2", "神経腫切除術（その他のもの）", "150073510"],
+  ["K196-5", "末梢神経遮断（挫滅又は切断）術（浅腓骨神経）", "150075550"],
+  ["K196-5", "末梢神経遮断（挫滅又は切断）術（深腓骨神経）", "150299650"],
+  ["K196-5", "末梢神経遮断（挫滅又は切断）術（後脛骨神経）", "150075650"],
+  ["K196-5", "末梢神経遮断（挫滅又は切断）術（腓腹神経）", "150299750"],
+  ["K197", "神経移行術", "150075810"],
+  ["K198", "神経移植術", "150076010"],
+  ["K466", "斜角筋切断術", "150120010"],
+  ["K468", "頸肋切除術", "150120310"],
+  ["K471", "筋性斜頸手術", "150120810"],
+  ["K482 1", "肋骨切除術（第１肋骨）", "150123210"],
+  ["K482 2", "肋骨切除術（その他の肋骨）", "150123310"],
+  ["K607-2", "血管縫合術（簡単なもの）", "150148750"],
+  ["K610 4", "動脈形成術、吻合術（指（手、足）の動脈）", "150276010"],
+  ["K610 5", "動脈形成術、吻合術（その他の動脈）", "150150610"],
+  ["K610-5", "血管吻合術及び神経再接合術（上腕動脈、正中神経及び尺骨神経）", "150151450"],
+  ["K614 5", "血管移植術、バイパス移植術（下腿、足部動脈）", "150360510"],
+  ["K614 6", "血管移植術、バイパス移植術（膝窩動脈）", "150387810"],
+  ["K614 7", "血管移植術、バイパス移植術（その他の動脈）", "150152710"],
+  ["K623 3", "静脈形成術、吻合術（その他の静脈）", "150154910"],
+  ["K625 1", "リンパ管腫摘出術（長径５センチメートル未満）", "150155410"],
+  ["K625 2", "リンパ管腫摘出術（長径５センチメートル以上）", "150155510"],
+  ["K643", "後腹膜悪性腫瘍手術", "150162310"]
+];
+
+const KCODE_BY_CODE = new Map();
+for (const r of KCODE_DATA) KCODE_BY_CODE.set(r[2], r);
+
+const KCODE_SCHEMA = {
+  name: "kcode_match",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            code: { type: "string", description: "リスト内の診療行為コード(9桁)" },
+            reason: { type: "string", description: "選定理由(15文字以内)" },
+          },
+          required: ["code", "reason"],
+        },
+      },
+    },
+    required: ["results"],
+  },
+};
+
+async function apiKcode(env, body) {
+  const query = String((body && body.query) || "").trim();
+  if (!query) return jsonError("術式名を入力してください", 400);
+  if (query.length > 100) return jsonError("入力が長すぎます(100文字まで)", 400);
+  if (!env.OPENAI_API_KEY) return jsonError("OPENAI_API_KEY が設定されていません", 500);
+
+  const listText = KCODE_DATA.map((r) => r[2] + "\t" + r[0] + "\t" + r[1]).join("\n");
+
+  const systemPrompt =
+    "あなたは整形外科の診療報酬請求に詳しい医療事務アシスタントです。" +
+    "ユーザーが入力した術式名(略語・英語・通称・表記ゆれを含む)に対し、" +
+    "提供された登録術式リストの中から意味的に最も近いものを近い順に5件選びます。" +
+    "リストにないコードは絶対に返さないでください。" +
+    "reasonは選定理由を15文字以内で簡潔に。";
+
+  const userPrompt =
+    "# 入力された術式\n" + query + "\n\n" +
+    "# 登録術式リスト (診療行為コード\t区分番号\t診療行為名称)\n" + listText;
+
+  const out = await callOpenAI(
+    env, MODEL_KCODE,
+    [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    1000, KCODE_SCHEMA
+  );
+
+  // コードをローカルの正データに逆引き(転記ミス・幻覚の防止)
+  const results = [];
+  const raw = (out.json && out.json.results) || [];
+  for (const r of raw) {
+    const row = KCODE_BY_CODE.get(String(r.code || "").trim());
+    if (!row) continue;                       // リスト外のコードは捨てる
+    results.push({ kcode: row[0], name: row[1], code: row[2], reason: String(r.reason || "") });
+    if (results.length >= 5) break;
+  }
+  if (!results.length) return jsonError("該当する術式が見つかりませんでした。表現を変えて検索してください", 200);
+  return jsonOk({ results: results, usage: out.usage || null });
+}
+
+// ============================================================
+// プロンプト
+// ============================================================
+const EXTRACT_SYSTEM = [
+  "あなたは日本の整形外科の手術記録用紙を読み取る、正確さ最優先のアシスタントです。",
+  "渡された画像は同一患者の手術記録(複数ページ)です。以下のルールで各項目の値を抽出してください。",
+  "",
+  "【読み取りルール】",
+  "- 各項目には「用紙上の目印」があります。その語を用紙内で探し、その近く(多くは右側または直後)に書かれている値を読みます。",
+  "- 「抽出ルール」の指示に必ず従ってください。代表例:",
+  "    「右側」= 目印の右にある値",
+  "    「3番目の時間」= その行に並ぶ時刻のうち3つ目。開始・終了・経過の順に並ぶ表では経過時間(所要時間)を指します",
+  "    「○で判断」= 手書きの丸で囲まれている選択肢を選ぶ",
+  "    「左右ピックアップ」= 文中から「左」または「右」だけを取り出す",
+  "    「その他の場合は（）内」= 「その他」に丸がついている場合は括弧内の記載を読む",
+  "    「丸がついている段落から判断」= 丸印がある段落・章を見て判断する",
+  "- 手書きの丸(○)で囲まれた選択肢が正解です。丸が無い選択肢は選ばないでください。",
+  "- 二重線や大きな×で消されている記載は無効です。採用しないでください。",
+  "- 「選択肢」が指定されている項目は、必ずその中のいずれか1つだけを、一字一句そのまま返してください。どれにも丸が無い場合は空文字にします。",
+  "- 【重要】目印の語や項目名そのもの(例:「執刀医」「助手」「手術時間」)を値として返してはいけません。目印は探すための手がかりであって答えではありません。目印の語しか見つからない場合は空文字を返してください。",
+  "- 同じ語が用紙内に複数ある場合、表の見出しや欄名として印刷されている箇所ではなく、実際に値が記入されている行を選んでください。",
+  "- 時刻が並ぶ表では、目的の行(例:「手術」の行)を必ず特定してから読みます。別の行(例:「麻酔」の行)の時刻を混ぜてはいけません。",
+  "- 選択肢のどれに丸がついているか迷う場合は、用紙の他の記載(例: 施行術式や診断名)と矛盾しない方を選んでください。",
+  "- 【最重要】用紙に実際に書かれている文字だけを返してください。それらしい氏名・病名・術式を自分で作ってはいけません。該当する記載を見つけられなければ必ず空文字を返します。空文字は正しい回答であり、埋めること自体が目的ではありません。",
+  "- 氏名の項目に候補リスト(enum)が指定されている場合は、そのリストが正解です。用紙の字とリストの表記が多少違っても(旧字/新字、かすれ、似た漢字)、字形が最も近い候補を選んでください。リストに無い氏名を新たに作ることはできません。",
+  "- 氏名の項目で候補リストが無い場合は、用紙に書かれている氏名をそのまま写します。読めない文字があればその項目を空文字にしてください(似た漢字で置き換えない)。",
+  "- 読み取れない、または用紙に記載が無い項目は、推測せず空文字を返してください。",
+  "- 値は用紙に書かれた通りに返します。余計な説明・単位の補完・言い換えはしないでください。",
+  "",
+  "【出力形式】",
+  "次のJSONだけを返してください。前置きやマークダウンは不要です。",
+  '{"results":{"項目のno(文字列)":"値", ...}}',
+].join("\n");
+
+const EXTRACT_USER_HEAD =
+  "添付した手術記録用紙の画像から、次の項目を抽出してください。\n\n【抽出する項目】\n";
+
+const LABEL_SYSTEM = [
+  "医療材料(インプラント・骨セメント等)のラベルやバーコード周辺の画像から、情報を読み取ってください。",
+  "※重要: 画像内に複数の材料ラベルがある場合は、見つかった【すべて】の材料を個別のアイテムとしてリスト化してください。ラベルが縦向き・横向き・斜めに貼られていても、向きに関わらず全て読むこと。",
+  "",
+  "【最重要・読み取り精度のルール】",
+  "・数字は絶対に推測しないこと。かすれ・つぶれで判別できない桁は、それらしい数字で埋めず空欄にする方がよい。",
+  "・バーコードの【下または周囲に印字された括弧付き数字テキスト】(例: (01)10885862086617(17)291105(21)B333632 )を最優先の情報源とすること。この人が読める数字列が正解で、バーコードの絵柄からは推測しないこと。",
+  "・(01)直後の数字は必ず14桁。末尾1桁はチェックデジット。桁数を数えて14桁でなければ読み間違いなので、画像を見て数え直すこと。",
+  "",
+  "【ラベルを跨がないルール(最重要)】",
+  "・1つの材料ラベル = 1つのアイテム。あるラベルの SN/REF/期限を、隣や別のラベルの値と混ぜないこと。各ラベルの枠内で完結させること。",
+  "・同じSN番号を複数の異なる製品に割り当てないこと。SNは個体固有なので製品ごとに必ず異なる。同じ値を2つ以上のアイテムに入れそうになったら取り違えなので画像を見直すこと。",
+  "",
+  "【使われなかった材料を除外するルール】",
+  "・大きな×印や二重線で消されているラベルは「使用しなかった材料」です。絶対に出力に含めないこと。",
+  "",
+  "【CE認証番号を絶対に拾わないルール(最重要)】",
+  "・「CE」マークの横や近くにある4桁数字(例: 2797, 0123, 0344)は認証機関番号であり、LOT でも REF でも SN でもない。これらは【どの項目にも入れない】こと。",
+  "・特に 2797 / 0123 は EU認証番号なので LOT に入れないこと。EQUINOXE等のラベルには LOT 欄が無いものが多く、その場合 lot は空欄が正しい。無理に LOT を埋めないこと。",
+  "",
+  "【REF と LOT と SN の区別(最重要・混同しやすい)】",
+  "・REF = カタログ番号 = 製品の品番。ラベル上で REF / CAT.NO / CAT NO と書かれた欄の値(例: 320-20-38, 304-22-11, 3070-040)。ハイフン区切りが多い。省略せず最後の桁まで全て読むこと(セメント等で尻切れにしない)。",
+  "・LOT = ロット番号 = 製造ロット。LOT / LOT.NO と書かれた欄の値(例: 612750013, 252L305, 66774188)。REF(CAT.NO)の値を絶対に lot に入れないこと。DePuyのラベルは CAT.NO と LOT.NO が上下に並ぶので、必ず LOT.NO 側の行の値を lot にすること。",
+  "・SN = シリアル番号 = 個体固有。(21)の後や SN 欄の値(例: B333632, B270787)。SN と REF は別物なので、両方あれば両方を別々に返すこと。",
+  "・日付(YYYY-MM-DD や YYMMDD)を lot に入れないこと。日付は必ず exp に入れる。",
+  "",
+  "【期限(exp)の探し方】",
+  "・砂時計マーク(アイコン)や EXP の【すぐ近く】にある YYYY-MM-DD または YYMMDD が使用期限。例: 砂時計の下の 2034-02-04。(17)YYMMDD があればそれも期限。製造日や他の日付と混同しないこと。",
+  "・年の桁を読み違えないよう、数字は1桁ずつ確認すること。",
+  "",
+  "各アイテムについて以下の項目を抽出してください:",
+  "1. title: 製品名と規格(サイズ・角度・容量・左右など)を1行で(60文字以内)。",
+  "2. gtin: (01)直後のGTIN(14桁)。無ければJAN(13桁)。括弧付きテキストが読めない時のみ空欄。",
+  "3. exp: 期限(砂時計/EXP の近くの日付、または(17)YYMMDD)。",
+  "4. lot: LOT/LOT.NO と明記された欄の値のみ。REF/CAT.NO やCE番号(2797/0123等)は絶対に入れない。LOT欄が無ければ空欄。",
+  "5. ref: REF/CAT.NO のカタログ番号(品番)。ハイフン込みで全桁。",
+  "6. sn: SN/シリアル((21)や SN 欄の値)。",
+  "7. maker: 製造販売業者名。ラベル下部の工場アイコンの横や、ロゴとして印字されている社名(例: Zimmer, Stryker Orthopaedics, DePuy, Exactech, Medos, Biomet, 京セラ, 帝人ナカシマ)。製品名の一部(PERSONA, EQUINOXE など)は社名ではないので入れない。読めなければ空。",
+  "読み取れない項目は空文字にしてください。推測で埋めないこと。",
+].join("\n");
+
+// strict schema — 聞いた項目を必ず全部、文字列で返させる
+const LABEL_SCHEMA = {
+  name: "labels_result",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      items: {
+        type: "array",
+        description: "画像内から見つかったすべての材料ラベル情報のリスト",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            title: { type: "string", description: "製品名+規格(60文字以内)" },
+            gtin:  { type: "string", description: "GTIN/JAN(数字13〜14桁)" },
+            exp:   { type: "string", description: "使用期限(砂時計/EXP付近の日付)" },
+            lot:   { type: "string", description: "LOT/LOT.NOの値のみ。REF/CAT.NOやCE番号は入れない" },
+            ref:   { type: "string", description: "REF/CAT.NOカタログ番号(品番、ハイフン込み全桁)" },
+            sn:    { type: "string", description: "シリアルナンバー(SN/(21)の値)" },
+            maker: { type: "string", description: "製造販売業者名(Zimmer, Stryker, DePuy等)。製品名は入れない" },
+          },
+          required: ["title", "gtin", "exp", "lot", "ref", "sn", "maker"],
+        },
+      },
+    },
+    required: ["items"],
+  },
+};
+
+// ============================================================
+// ▲▲ [フェーズ②] 抽出API / 材料シールAPI ここまで ▲▲
+// ============================================================
+
+// ============================================================
+// 管理画面HTML
+// ============================================================
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>オペコピ — 対象用紙マスタ管理</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📋</text></svg>">
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#fff; --line:#e4e7ec; --ink:#2b2f36; --sub:#8a919c;
+    --accent:#f0a500; --accent2:#2aa9a0; --danger:#e5534b; --soft:#fbfcfd;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic UI",Meiryo,sans-serif;
+    font-size:14px;line-height:1.6}
+  .wrap{max-width:1040px;margin:0 auto;padding:18px 16px 80px}
+  .top{display:flex;align-items:baseline;gap:10px;margin-bottom:16px;flex-wrap:wrap}
+  .top h1{font-size:20px;margin:0}
+  .top small{color:var(--sub);font-weight:400;font-size:13px}
+  .hidden{display:none !important}
+
+  .bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+  .btn{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:9px;
+    padding:8px 14px;font-size:13px;font-weight:700;cursor:pointer;transition:.12s}
+  .btn:hover{background:var(--soft)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{opacity:.88}
+  .btn.teal{background:var(--accent2);border-color:var(--accent2);color:#fff}
+  .btn.teal:hover{opacity:.88}
+  .btn.danger{color:var(--danger);border-color:#f2c4c1}
+  .btn.danger:hover{background:#fdf3f2}
+  .btn.mini{padding:4px 9px;font-size:12px;border-radius:7px}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+
+  table.list{width:100%;border-collapse:collapse;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  table.list th,table.list td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
+  table.list th{background:var(--soft);color:var(--sub);font-weight:700;font-size:12px}
+  table.list tr:last-child td{border-bottom:0}
+  .mname{font-weight:700}
+  .mid{color:var(--sub);font-size:12px;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .todo{display:inline-block;background:#fff3e0;color:#b26a00;border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;margin-left:6px}
+  .okbadge{display:inline-block;background:#e8f6f4;color:#1d7d76;border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;margin-left:6px}
+  .empty{text-align:center;color:var(--sub);padding:40px 10px}
+
+  .ehead{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:6px}
+  .fld{display:flex;flex-direction:column;gap:3px}
+  .fld label{font-size:11px;color:var(--sub);font-weight:700}
+  input[type=text],select,textarea{border:1px solid var(--line);border-radius:8px;padding:7px 9px;
+    font-size:13px;font-family:inherit;background:#fff;color:var(--ink)}
+  input[type=text]:focus,select:focus,textarea:focus{outline:2px solid rgba(240,165,0,.35);border-color:var(--accent)}
+  textarea{resize:vertical;min-height:220px;width:100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+
+  .secline{margin:16px 0 8px;font-weight:700;color:var(--accent2);font-size:13px;
+    border-left:4px solid var(--accent2);padding-left:8px}
+
+  .item{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+  .item.drag{opacity:.4}
+  .item.over{border-color:var(--accent);box-shadow:0 0 0 2px rgba(240,165,0,.2)}
+  .irow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .irow.second{margin-top:8px}
+  .grip{cursor:grab;color:var(--sub);font-size:16px;user-select:none;padding:0 2px}
+  .num{color:var(--sub);font-size:12px;min-width:26px;font-weight:700}
+  .grow{flex:1;min-width:170px}
+  .grow input{width:100%}
+  .w120{width:120px}
+  .w150{width:150px}
+  .spacer{flex:1}
+  .warn{color:#b26a00;font-size:11px;font-weight:700;margin-top:5px}
+
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999;display:flex;
+    align-items:center;justify-content:center;padding:16px}
+  .modal{background:#fff;border-radius:14px;max-width:600px;width:100%;max-height:88vh;
+    display:flex;flex-direction:column;overflow:hidden;box-shadow:0 14px 44px rgba(0,0,0,.28)}
+  .mhead{padding:14px 16px;font-weight:700;border-bottom:1px solid var(--line)}
+  .mbody{padding:14px 16px;overflow:auto}
+  .mfoot{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+  .sheetrow{display:flex;align-items:center;gap:9px;padding:7px 4px;border-bottom:1px dashed var(--line)}
+  .sheetrow:last-child{border-bottom:0}
+  .sheetrow input[type=checkbox]{width:17px;height:17px}
+  .sheetname{font-weight:700}
+  .sheetmeta{color:var(--sub);font-size:12px}
+  .hint{color:var(--sub);font-size:12px;margin:6px 0 10px}
+
+  /* ▼▼ ログイン ▼▼ */
+  #loginOverlay{position:fixed;inset:0;z-index:200;background:rgba(243,245,247,.92);
+    backdrop-filter:blur(3px);display:flex;align-items:flex-start;justify-content:center;padding:24px 16px}
+  #loginOverlay.hidden{display:none}
+  #loginOverlay .logincard{background:#fff;border:1px solid var(--line);border-radius:12px;
+    padding:22px 20px;max-width:380px;width:100%;margin-top:60px;text-align:center;
+    box-shadow:0 8px 30px rgba(0,0,0,.10)}
+  #loginOverlay .login-emoji{font-size:32px}
+  #loginOverlay .login-title{font-size:17px;font-weight:700;margin:8px 0 14px}
+  #loginPw{width:100%;text-align:center;font-size:16px;padding:11px 10px;margin-bottom:10px}
+  #loginBtn{display:block;width:100%;font-size:15px;font-weight:700;padding:12px 0;border:none;
+    border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+  #loginBtn:hover{opacity:.9}
+  #loginErr{color:var(--danger);font-size:12.5px;font-weight:700;margin-top:10px;min-height:18px}
+  /* ▲▲ ログインここまで ▲▲ */
+  .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#2b2f36;color:#fff;
+    padding:10px 18px;border-radius:10px;font-size:13px;font-weight:700;z-index:2000;opacity:0;
+    transition:opacity .2s;pointer-events:none}
+  .toast.show{opacity:1}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(0,0,0,.15);
+    border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="top">
+    <h1>📋 オペコピ</h1>
+    <small>対象用紙マスタ管理</small>
+  </div>
+
+  <!-- ============ 一覧ビュー ============ -->
+  <section id="listView">
+    <div class="bar">
+      <button class="btn primary" id="btnNew">➕ 新規作成</button>
+      <button class="btn teal" id="btnImport">📥 Excelから取込</button>
+      <button class="btn" id="btnExport">📤 Excel書き出し</button>
+      <button class="btn" id="btnDoc">👨‍⚕️ 医師マスタ</button>
+      <button class="btn" id="btnReload">🔄 再読込</button>
+    </div>
+    <div id="listBody"><div class="empty"><span class="spin"></span> 読込中…</div></div>
+  </section>
+
+  <!-- ============ 編集ビュー ============ -->
+  <section id="editView" class="hidden">
+    <div class="bar">
+      <button class="btn" id="btnBack">← 一覧へ</button>
+      <button class="btn primary" id="btnSave">💾 保存</button>
+      <button class="btn" id="btnJson">📄 JSON</button>
+      <span class="spacer"></span>
+      <button class="btn" id="btnAddItem">➕ 項目を追加</button>
+    </div>
+
+    <div class="card">
+      <div class="ehead">
+        <div class="fld grow">
+          <label>マスタ名（画面に出る名前）</label>
+          <input type="text" id="mName" placeholder="例) TSARSA（人工肩関節/リバース）">
+        </div>
+        <div class="fld">
+          <label>ID（半角英数字・保存キー）</label>
+          <input type="text" id="mId" class="w150" placeholder="tsarsa">
+        </div>
+      </div>
+      <div class="hint" id="mStat"></div>
+    </div>
+
+    <div id="itemsBody"></div>
+  </section>
+
+</div>
+
+<!-- ============ Excel取込モーダル ============ -->
+<div class="overlay hidden" id="impModal">
+  <div class="modal">
+    <div class="mhead">📥 Excelから対象用紙マスタを取込</div>
+    <div class="mbody">
+      <div class="hint">
+        列の並びは <b>A:No / B:項目名 / C:出力内容 / D:(読取りフォーカス＝無視) / E:読取り文字 / F:出力対象</b> を想定。<br>
+        B列が【…】の行はセクション見出しとして扱います。<br>
+        <b>シートごとに1マスタ</b>として取込むので、10種類をシート分けした1冊でも一括登録できます。
+      </div>
+      <input type="file" id="xlFile" accept=".xlsx,.xlsm,.xls,.csv">
+      <div id="sheetList" style="margin-top:12px"></div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="impCancel">キャンセル</button>
+      <button class="btn primary" id="impRun" disabled>取込む</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 医師マスタ ============ -->
+<div class="overlay hidden" id="docModal">
+  <div class="modal">
+    <div class="mhead">👨‍⚕️ 医師マスタ<small style="display:block;font-weight:400;color:#8a919c;font-size:12px;margin-top:3px">1行に1名。読み取った氏名をこのリストの最も近い名前に自動で寄せます</small></div>
+    <div class="mbody">
+      <div class="bar">
+        <input type="file" id="docFile" accept=".xlsx,.xlsm,.xls,.csv" style="display:none">
+        <button class="btn" id="docImport">📥 Excelから取込</button>
+        <button class="btn" id="docExport">📤 Excel書き出し</button>
+        <span class="hint" id="docCount" style="margin-left:auto;align-self:center"></span>
+      </div>
+      <div class="hint">Excel取込は、選んだファイルの<b>1枚目のシートのA列</b>を氏名として読みます（見出し行は自動で除外）。</div>
+      <textarea id="docArea" spellcheck="false" placeholder="袖山 知典&#10;畠山 健次&#10;小島 敦"></textarea>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="docClose">閉じる</button>
+      <button class="btn primary" id="docSave">💾 保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ JSONモーダル ============ -->
+<div class="overlay hidden" id="jsonModal">
+  <div class="modal">
+    <div class="mhead">📄 マスタJSON</div>
+    <div class="mbody">
+      <div class="hint">内容を書き換えて「この内容で置換」を押すと編集中のマスタに反映されます（保存はまだ）。</div>
+      <textarea id="jsonArea" spellcheck="false"></textarea>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="jsonClose">閉じる</button>
+      <button class="btn" id="jsonCopy">📋 コピー</button>
+      <button class="btn primary" id="jsonApply">この内容で置換</button>
+    </div>
+  </div>
+</div>
+
+<!-- ▼▼ ログイン ▼▼ -->
+<div id="loginOverlay" class="hidden">
+  <div class="logincard">
+    <div class="login-emoji">🔐</div>
+    <div class="login-title">オペコピ</div>
+    <input type="password" id="loginPw" placeholder="パスワード" autocomplete="current-password">
+    <button id="loginBtn">入る</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
+<!-- ▲▲ ログインここまで ▲▲ -->
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ============================================================
+// 状態
+// ============================================================
+var cur = null;          // 編集中マスタ {id,name,items:[]}
+var curIsNew = false;    // 新規作成中か
+var dragFrom = -1;       // ドラッグ元index
+
+var TYPES = [
+  ["ocr",     "🔍 OCR読取"],
+  ["choice",  "☑️ 選択肢"],
+  ["fixed",   "📌 固定値"],
+  ["sticker", "🏷️ 材料シール"],
+  ["confirm", "❓ 要確認"],
+  ["unset",   "⬜ 未設定"]
+];
+
+// ============================================================
+// 共通ユーティリティ
+// ============================================================
+function $(id){ return document.getElementById(id); }
+
+function esc(s){
+  return String(s == null ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+function splitList(s){
+  if (Object.prototype.toString.call(s) === "[object Array]") {
+    var r = [];
+    for (var k=0;k<s.length;k++){ var v=String(s[k]==null?"":s[k]).trim(); if(v) r.push(v); }
+    return r;
+  }
+  var t = String(s == null ? "" : s);
+  t = t.split("、").join(",");
+  t = t.split("，").join(",");
+  t = t.split(String.fromCharCode(10)).join(",");
+  var a = t.split(",");
+  var out = [];
+  for (var i=0;i<a.length;i++){ var x = a[i].trim(); if(x) out.push(x); }
+  return out;
+}
+
+function sanitizeId(s){
+  var lower = String(s||"").trim().toLowerCase();
+  var out = "";
+  for (var i=0;i<lower.length;i++){
+    var c = lower.charAt(i);
+    var isNum = (c >= "0" && c <= "9");
+    var isAl  = (c >= "a" && c <= "z");
+    if (isNum || isAl || c === "-" || c === "_") out += c;
+  }
+  return out.slice(0,60);
+}
+
+function autoId(name){
+  var s = sanitizeId(name);
+  if (s) return s;
+  return "m" + String(Date.now()).slice(-8);
+}
+
+function toast(msg){
+  var t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(function(){ t.classList.remove("show"); }, 2200);
+}
+
+function fmtDate(iso){
+  if (!iso) return "-";
+  try {
+    var d = new Date(iso);
+    return d.toLocaleString("ja-JP", { year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit" });
+  } catch(e){ return "-"; }
+}
+
+async function api(path, opt){
+  opt = opt || {};
+  var h = {};
+  if (opt.headers){ for (var k in opt.headers) h[k] = opt.headers[k]; }
+  var t = getToken();
+  if (t) h["x-ope-auth"] = t;
+  opt.headers = h;
+  var res = await fetch(path, opt);
+  if (res.status === 401){ clearToken(); showLogin(); throw new Error("認証が必要です"); }
+  var data = await res.json();
+  if (!data.ok) throw new Error(data.error || "APIエラー");
+  return data;
+}
+
+// ============================================================
+// 一覧ビュー
+// ============================================================
+async function loadList(){
+  $("listBody").innerHTML = '<div class="empty"><span class="spin"></span> 読込中…</div>';
+  try {
+    var data = await api("/api/masters");
+    renderList(data.masters || []);
+  } catch(e){
+    $("listBody").innerHTML = '<div class="empty">読込に失敗: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderList(masters){
+  if (!masters.length){
+    $("listBody").innerHTML =
+      '<div class="empty">まだマスタがありません。<br>「📥 Excelから取込」でTSARSAのシートを読ませるのが早いよ。</div>';
+    return;
+  }
+  var h = '<table class="list"><thead><tr>' +
+          '<th>マスタ名</th><th>ID</th><th>項目数</th><th>更新</th><th style="width:220px"></th>' +
+          '</tr></thead><tbody>';
+  for (var i=0;i<masters.length;i++){
+    var m = masters[i];
+    var badge = "";
+    if (m.stickerTodo > 0) badge = '<span class="todo">材料KW未設定 ' + m.stickerTodo + '</span>';
+    else if (m.stickerTodo === 0) badge = '<span class="okbadge">材料KW OK</span>';
+    h += '<tr>' +
+      '<td><span class="mname">' + esc(m.name) + '</span>' + badge + '</td>' +
+      '<td class="mid">' + esc(m.id) + '</td>' +
+      '<td>' + (m.count == null ? "-" : m.count) + '</td>' +
+      '<td class="mid">' + esc(fmtDate(m.updatedAt)) + '</td>' +
+      '<td>' +
+        '<button class="btn mini" data-act="edit" data-id="' + esc(m.id) + '">✏️ 編集</button> ' +
+        '<button class="btn mini" data-act="copy" data-id="' + esc(m.id) + '">📑 複製</button> ' +
+        '<button class="btn mini danger" data-act="del" data-id="' + esc(m.id) + '">🗑 削除</button>' +
+      '</td></tr>';
+  }
+  h += '</tbody></table>';
+  $("listBody").innerHTML = h;
+
+  var btns = $("listBody").querySelectorAll("button[data-act]");
+  for (var j=0;j<btns.length;j++){
+    btns[j].addEventListener("click", onListAction);
+  }
+}
+
+async function onListAction(ev){
+  var b = ev.currentTarget;
+  var act = b.getAttribute("data-act");
+  var id  = b.getAttribute("data-id");
+  if (act === "edit") return openEdit(id);
+  if (act === "copy") return copyMaster(id);
+  if (act === "del")  return deleteMaster(id);
+}
+
+async function deleteMaster(id){
+  if (!confirm("「" + id + "」を削除します。よろしい？")) return;
+  try {
+    await api("/api/master/delete", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ id: id })
+    });
+    toast("削除しました");
+    loadList();
+  } catch(e){ alert("削除に失敗: " + e.message); }
+}
+
+async function copyMaster(id){
+  try {
+    var data = await api("/api/master?id=" + encodeURIComponent(id));
+    var src = data.master;
+    var newName = prompt("複製後のマスタ名", src.name + " のコピー");
+    if (newName === null) return;
+    newName = String(newName).trim();
+    if (!newName) return;
+    var newId = prompt("複製後のID（半角英数字）", sanitizeId(src.id + "-copy"));
+    if (newId === null) return;
+    newId = sanitizeId(newId);
+    if (!newId){ alert("IDが不正です"); return; }
+
+    cur = { id:newId, name:newName, items: JSON.parse(JSON.stringify(src.items || [])) };
+    curIsNew = true;
+    showEdit();
+    toast("複製しました（未保存）");
+  } catch(e){ alert("複製に失敗: " + e.message); }
+}
+
+// ============================================================
+// 編集ビュー
+// ============================================================
+async function openEdit(id){
+  try {
+    var data = await api("/api/master?id=" + encodeURIComponent(id));
+    cur = data.master;
+    if (!cur.items) cur.items = [];
+    curIsNew = false;
+    showEdit();
+  } catch(e){ alert("読込に失敗: " + e.message); }
+}
+
+function newMaster(){
+  var name = prompt("マスタ名（例: TKA（人工膝関節））", "");
+  if (name === null) return;
+  name = String(name).trim();
+  if (!name) return;
+  cur = { id: autoId(name), name: name, items: [] };
+  curIsNew = true;
+  showEdit();
+}
+
+function showEdit(){
+  $("listView").classList.add("hidden");
+  $("editView").classList.remove("hidden");
+  $("mName").value = cur.name || "";
+  $("mId").value = cur.id || "";
+  renderItems();
+  window.scrollTo(0,0);
+}
+
+function showList(){
+  $("editView").classList.add("hidden");
+  $("listView").classList.remove("hidden");
+  cur = null;
+  loadList();
+}
+
+function renderItems(){
+  var items = cur.items;
+  var stickerTodo = 0, byType = {};
+  for (var i=0;i<items.length;i++){
+    var t = items[i].type || "unset";
+    byType[t] = (byType[t]||0) + 1;
+    if (t === "sticker" && splitList(items[i].matKeywords).length === 0) stickerTodo++;
+  }
+  var stat = "全 " + items.length + " 項目";
+  for (var k=0;k<TYPES.length;k++){
+    var code = TYPES[k][0];
+    if (byType[code]) stat += " ／ " + TYPES[k][1] + " " + byType[code];
+  }
+  if (stickerTodo > 0) stat += '　<span class="todo">材料キーワード未設定 ' + stickerTodo + '件</span>';
+  $("mStat").innerHTML = stat;
+
+  var h = "";
+  var lastSection = null;
+  for (var n=0;n<items.length;n++){
+    var it = items[n];
+    var sec = it.section || "";
+    if (sec !== lastSection){
+      h += '<div class="secline">' + (sec ? esc(sec) : "（セクションなし）") + '</div>';
+      lastSection = sec;
+    }
+    h += itemCard(it, n, items.length);
+  }
+  $("itemsBody").innerHTML = h;
+  wireItems();
+}
+
+function itemCard(it, idx, total){
+  var type = it.type || "unset";
+  var h = '<div class="item" draggable="true" data-idx="' + idx + '">';
+
+  // 1段目: 並び替え / 番号 / セクション / 項目名 / 削除
+  h += '<div class="irow">';
+  h += '<span class="grip" title="ドラッグで並び替え">⠿</span>';
+  h += '<span class="num">#' + (idx+1) + '</span>';
+  h += '<button class="btn mini" data-mv="up" data-idx="' + idx + '"' + (idx===0?" disabled":"") + '>▲</button>';
+  h += '<button class="btn mini" data-mv="down" data-idx="' + idx + '"' + (idx===total-1?" disabled":"") + '>▼</button>';
+  h += '<div class="fld w150"><label>セクション</label>' +
+       '<input type="text" class="w150" data-f="section" data-idx="' + idx + '" value="' + esc(it.section||"") + '" placeholder="基本項目"></div>';
+  h += '<div class="fld grow"><label>項目名（JOANRの欄名）</label>' +
+       '<input type="text" data-f="label" data-idx="' + idx + '" value="' + esc(it.label||"") + '"></div>';
+  h += '<div class="fld"><label>種別</label><select class="w120" data-f="type" data-idx="' + idx + '">';
+  for (var i=0;i<TYPES.length;i++){
+    h += '<option value="' + TYPES[i][0] + '"' + (TYPES[i][0]===type?" selected":"") + '>' + TYPES[i][1] + '</option>';
+  }
+  h += '</select></div>';
+  h += '<button class="btn mini danger" data-del="' + idx + '">🗑</button>';
+  h += '</div>';
+
+  // 2段目: 種別ごとの入力欄
+  var second = "";
+  if (type === "ocr" || type === "choice"){
+    second += '<div class="fld"><label>候補リスト</label><select class="w150" data-f="suggest" data-idx="' + idx + '">' +
+      '<option value=""' + (it.suggest ? "" : " selected") + '>なし</option>' +
+      '<option value="kcode"' + (it.suggest === "kcode" ? " selected" : "") + '>🔍 登録術式(Kコード)</option>' +
+      '<option value="doctor"' + (it.suggest === "doctor" ? " selected" : "") + '>👨‍⚕️ 医師マスタ</option>' +
+      '</select></div>';
+  }
+  if (type === "ocr"){
+    second += '<div class="fld w150"><label>読取り文字（用紙上のラベル）</label>' +
+      '<input type="text" class="w150" data-f="keyword" data-idx="' + idx + '" value="' + esc(it.keyword||"") + '" placeholder="施行術式"></div>';
+    second += '<div class="fld grow"><label>抽出ルール</label>' +
+      '<input type="text" data-f="rule" data-idx="' + idx + '" value="' + esc(it.rule||"") + '" placeholder="右側 / 3番目の時間 / ○で判断"></div>';
+  } else if (type === "choice"){
+    second += '<div class="fld w150"><label>読取り文字</label>' +
+      '<input type="text" class="w150" data-f="keyword" data-idx="' + idx + '" value="' + esc(it.keyword||"") + '"></div>';
+    second += '<div class="fld grow"><label>選択肢（カンマ区切り）</label>' +
+      '<input type="text" data-f="choices" data-idx="' + idx + '" value="' + esc(splitList(it.choices).join(",")) + '" placeholder="左,右"></div>';
+    second += '<div class="fld grow"><label>抽出ルール</label>' +
+      '<input type="text" data-f="rule" data-idx="' + idx + '" value="' + esc(it.rule||"") + '" placeholder="○で判断"></div>';
+  } else if (type === "fixed"){
+    second += '<div class="fld grow"><label>固定値（OCRせずこの値を出す）</label>' +
+      '<input type="text" data-f="value" data-idx="' + idx + '" value="' + esc(it.value||"") + '" placeholder="入院手術"></div>';
+  } else if (type === "sticker"){
+    var kws = splitList(it.matKeywords);
+    var ngs = splitList(it.ngKeywords);
+    second += '<div class="fld grow"><label>材料キーワード（カンマ区切り／製品名から この材料を特定する語。語は長めに）</label>' +
+      '<input type="text" data-f="matKeywords" data-idx="' + idx + '" value="' + esc(kws.join(",")) + '" placeholder="Bone Cement,Endurance,Palacos"></div>';
+    second += '<div class="fld grow"><label>除外キーワード（この語を含むシールは除く）</label>' +
+      '<input type="text" data-f="ngKeywords" data-idx="' + idx + '" value="' + esc(ngs.join(",")) + '" placeholder="Plug,CEMENTED"></div>';
+  }
+  if (second) h += '<div class="irow second">' + second + '</div>';
+
+  if (type === "sticker" && splitList(it.matKeywords).length === 0){
+    h += '<div class="warn">⚠️ 材料キーワード未設定 — このままだとシールの自動割当ができません</div>';
+  }
+
+  h += '</div>';
+  return h;
+}
+
+function wireItems(){
+  var body = $("itemsBody");
+
+  // 入力（再描画せず値だけ反映＝入力中にフォーカスが飛ばない）
+  var ins = body.querySelectorAll("input[data-f]");
+  for (var i=0;i<ins.length;i++){
+    ins[i].addEventListener("input", function(ev){
+      var el = ev.currentTarget;
+      var idx = parseInt(el.getAttribute("data-idx"),10);
+      var f = el.getAttribute("data-f");
+      if (f === "choices" || f === "matKeywords" || f === "ngKeywords") cur.items[idx][f] = splitList(el.value);
+      else cur.items[idx][f] = el.value;
+    });
+  }
+  // セクション変更は見出しが変わるので、離れた時だけ再描画
+  var secs = body.querySelectorAll('input[data-f="section"]');
+  for (var s=0;s<secs.length;s++){
+    secs[s].addEventListener("change", function(){ renderItems(); });
+  }
+  // 種別変更 → 入力欄が変わるので再描画
+  var sels = body.querySelectorAll("select[data-f]");
+  for (var j=0;j<sels.length;j++){
+    sels[j].addEventListener("change", function(ev){
+      var el = ev.currentTarget;
+      var idx = parseInt(el.getAttribute("data-idx"),10);
+      var f = el.getAttribute("data-f");
+      if (f === "suggest"){ cur.items[idx].suggest = el.value; return; }   // 入力欄は変わらないので再描画しない
+      cur.items[idx].type = el.value;
+      renderItems();
+    });
+  }
+  // ▲▼
+  var mvs = body.querySelectorAll("button[data-mv]");
+  for (var m=0;m<mvs.length;m++){
+    mvs[m].addEventListener("click", function(ev){
+      var el = ev.currentTarget;
+      var idx = parseInt(el.getAttribute("data-idx"),10);
+      var dir = el.getAttribute("data-mv") === "up" ? -1 : 1;
+      moveItem(idx, idx + dir);
+    });
+  }
+  // 削除
+  var dels = body.querySelectorAll("button[data-del]");
+  for (var d=0;d<dels.length;d++){
+    dels[d].addEventListener("click", function(ev){
+      var idx = parseInt(ev.currentTarget.getAttribute("data-del"),10);
+      if (!confirm("「" + (cur.items[idx].label || "この項目") + "」を削除しますか？")) return;
+      cur.items.splice(idx,1);
+      renderItems();
+    });
+  }
+  // ドラッグ並び替え
+  var cards = body.querySelectorAll(".item");
+  for (var c=0;c<cards.length;c++){
+    cards[c].addEventListener("dragstart", function(ev){
+      dragFrom = parseInt(ev.currentTarget.getAttribute("data-idx"),10);
+      ev.currentTarget.classList.add("drag");
+      if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "move";
+    });
+    cards[c].addEventListener("dragend", function(ev){
+      ev.currentTarget.classList.remove("drag");
+      var os = body.querySelectorAll(".item.over");
+      for (var q=0;q<os.length;q++) os[q].classList.remove("over");
+    });
+    cards[c].addEventListener("dragover", function(ev){
+      ev.preventDefault();
+      ev.currentTarget.classList.add("over");
+    });
+    cards[c].addEventListener("dragleave", function(ev){
+      ev.currentTarget.classList.remove("over");
+    });
+    cards[c].addEventListener("drop", function(ev){
+      ev.preventDefault();
+      var to = parseInt(ev.currentTarget.getAttribute("data-idx"),10);
+      ev.currentTarget.classList.remove("over");
+      if (dragFrom >= 0 && dragFrom !== to) moveItem(dragFrom, to);
+      dragFrom = -1;
+    });
+  }
+}
+
+function moveItem(from, to){
+  if (from < 0 || from >= cur.items.length) return;
+  if (to   < 0 || to   >= cur.items.length) return;
+  var it = cur.items.splice(from,1)[0];
+  cur.items.splice(to,0,it);
+  renderItems();
+}
+
+function addItem(){
+  var lastSec = cur.items.length ? (cur.items[cur.items.length-1].section || "") : "";
+  cur.items.push({ section:lastSec, label:"", type:"unset" });
+  renderItems();
+  var body = $("itemsBody");
+  var ins = body.querySelectorAll('input[data-f="label"]');
+  if (ins.length) ins[ins.length-1].focus();
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+async function saveMaster(){
+  cur.name = $("mName").value.trim();
+  var id = sanitizeId($("mId").value);
+  if (!cur.name){ alert("マスタ名を入れてね"); return; }
+  if (!id){ alert("IDは半角英数字で入れてね"); return; }
+  if (!cur.items.length){ alert("項目が空だよ"); return; }
+
+  var noLabel = 0;
+  for (var i=0;i<cur.items.length;i++){ if (!String(cur.items[i].label||"").trim()) noLabel++; }
+  if (noLabel){
+    if (!confirm("項目名が空の行が " + noLabel + " 件あります。保存時に削除されますが良い？")) return;
+  }
+  cur.id = id;
+
+  var btn = $("btnSave");
+  btn.disabled = true; btn.textContent = "⏳ 保存中…";
+  try {
+    var data = await api("/api/master", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ id: cur.id, name: cur.name, items: cur.items })
+    });
+    cur = data.master;
+    curIsNew = false;
+    renderItems();
+    var msg = "保存しました";
+    if (data.stickerTodo > 0) msg += "（材料キーワード未設定 " + data.stickerTodo + "件）";
+    toast(msg);
+  } catch(e){
+    alert("保存に失敗: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "💾 保存";
+  }
+}
+
+// ============================================================
+// JSONモーダル
+// ============================================================
+function openJson(){
+  var obj = { id: sanitizeId($("mId").value), name: $("mName").value.trim(), items: cur.items };
+  $("jsonArea").value = JSON.stringify(obj, null, 2);
+  $("jsonModal").classList.remove("hidden");
+}
+function applyJson(){
+  try {
+    var obj = JSON.parse($("jsonArea").value);
+    if (!obj || Object.prototype.toString.call(obj.items) !== "[object Array]") {
+      alert("items配列が見つかりません"); return;
+    }
+    cur.items = obj.items;
+    if (obj.name) { cur.name = obj.name; $("mName").value = obj.name; }
+    if (obj.id)   { cur.id = sanitizeId(obj.id); $("mId").value = cur.id; }
+    $("jsonModal").classList.add("hidden");
+    renderItems();
+    toast("置換しました（未保存）");
+  } catch(e){ alert("JSONが不正: " + e.message); }
+}
+
+// ============================================================
+// Excel取込
+// ============================================================
+var xlsxLoading = null;
+function ensureXLSX(){
+  if (window.XLSX) return Promise.resolve();
+  if (xlsxLoading) return xlsxLoading;
+  var urls = [
+    "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js",
+    "https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"
+  ];
+  xlsxLoading = new Promise(function(resolve, reject){
+    var i = 0;
+    function tryNext(){
+      if (i >= urls.length){
+        xlsxLoading = null;
+        reject(new Error("Excelライブラリの読み込みに失敗しました(ネットワーク制限の可能性)"));
+        return;
+      }
+      var s = document.createElement("script");
+      s.src = urls[i++];
+      s.onload = function(){ resolve(); };
+      s.onerror = function(){ tryNext(); };
+      document.head.appendChild(s);
+    }
+    tryNext();
+  });
+  return xlsxLoading;
+}
+
+// [[...]] を取り出す（正規表現を使わない：テンプレートリテラル内のバックスラッシュ事故防止）
+function extractTokens(s){
+  var out = [], i = 0, str = String(s||"");
+  while (true){
+    var a = str.indexOf("[[", i);
+    if (a < 0) break;
+    var b = str.indexOf("]]", a+2);
+    if (b < 0) break;
+    var t = str.slice(a+2, b).trim();
+    if (t) out.push(t);
+    i = b + 2;
+  }
+  return out;
+}
+
+// C列(出力内容) / E列(読取り文字) / F列(出力対象) から種別を判定
+function classifyRow(out, kw, rule){
+  var o = String(out||"").trim();
+  if (o.indexOf("シール") >= 0) return "sticker";
+  var toks = extractTokens(o);
+  if (toks.length >= 2) return "choice";
+  if (toks.length === 1) return "fixed";
+  if (o === "確認" || o.indexOf("確認") >= 0) return "confirm";
+  if (String(kw||"").trim() || String(rule||"").trim()) return "ocr";
+  return "unset";
+}
+
+function looksLikeHeader(r){
+  var j = String(r[1]||"") + "|" + String(r[2]||"") + "|" + String(r[4]||"") + "|" + String(r[5]||"");
+  return j.indexOf("JOANR") >= 0 || j.indexOf("出力内容") >= 0 ||
+         j.indexOf("読取り") >= 0 || j.indexOf("出力対象") >= 0;
+}
+
+function isSectionLabel(lab){
+  var s = String(lab||"").trim();
+  return s.length >= 3 && s.charAt(0) === "【" && s.charAt(s.length-1) === "】";
+}
+
+// 1シート → items配列
+function sheetToItems(rows){
+  var items = [];
+  var section = "";
+  for (var r=0;r<rows.length;r++){
+    var row = rows[r] || [];
+    if (r === 0 && looksLikeHeader(row)) continue;
+    var lab  = String(row[1]==null?"":row[1]).trim();
+    var out  = String(row[2]==null?"":row[2]).trim();
+    // row[3] = 読取りフォーカス列 → 廃止につき読まない
+    var kw   = String(row[4]==null?"":row[4]).trim();
+    var rule = String(row[5]==null?"":row[5]).trim();
+    var sug  = String(row[6]==null?"":row[6]).trim();   // G列: 候補リスト
+    var mkw  = String(row[7]==null?"":row[7]).trim();   // H列: 材料キーワード
+    var nkw  = String(row[8]==null?"":row[8]).trim();   // I列: 除外キーワード
+    if (!lab) continue;
+    if (isSectionLabel(lab)){ section = lab.slice(1, lab.length-1); continue; }
+
+    var type = classifyRow(out, kw, rule);
+    var it = { no: items.length+1, section: section, label: lab, type: type };
+    if (type === "fixed"){
+      var t1 = extractTokens(out);
+      it.value = t1.length ? t1[0] : out;
+    }
+    if (type === "choice"){
+      it.choices = extractTokens(out);
+    }
+    if (type === "ocr" || type === "choice"){
+      if (kw) it.keyword = kw;
+      if (rule) it.rule = rule;
+      if (sug === "kcode") it.suggest = "kcode";
+    }
+    if (type === "sticker"){
+      it.source = "label";
+      it.matKeywords = splitList(mkw);
+      it.ngKeywords = splitList(nkw);
+    }
+    items.push(it);
+  }
+  return items;
+}
+
+// A列だけに氏名が並ぶシート = 医師マスタとみなす
+function sheetToDoctors(rows){
+  var names = [];
+  for (var i=0;i<rows.length;i++){
+    var r = rows[i] || [];
+    var a = String(r[0]==null?"":r[0]).trim();
+    var other = "";
+    for (var c=1;c<6;c++) other += String(r[c]==null?"":r[c]).trim();
+    if (other) return [];            // B〜F列に中身がある = 用紙マスタなので対象外
+    if (!a) continue;
+    if (i === 0 && (a.indexOf("氏名") >= 0 || a.indexOf("医師") >= 0 || a.indexOf("名前") >= 0)) continue;
+    names.push(a);
+  }
+  return names.length >= 3 ? names : [];
+}
+
+var impWb = null;      // 読み込んだワークブック
+var impParsed = [];    // [{sheet, items}]
+
+function openImport(){
+  impWb = null; impParsed = [];
+  $("xlFile").value = "";
+  $("sheetList").innerHTML = "";
+  $("impRun").disabled = true;
+  $("impModal").classList.remove("hidden");
+}
+
+async function onXlFile(){
+  var f = $("xlFile").files[0];
+  if (!f) return;
+  $("sheetList").innerHTML = '<div class="hint"><span class="spin"></span> 解析中…</div>';
+  try {
+    await ensureXLSX();
+    var buf = await f.arrayBuffer();
+    impWb = window.XLSX.read(buf, { type:"array" });
+    impParsed = [];
+    var names = impWb.SheetNames || [];
+    for (var i=0;i<names.length;i++){
+      var ws = impWb.Sheets[names[i]];
+      var rows = window.XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+      var items = sheetToItems(rows);
+      // 用紙マスタとして読めなかったシートは、氏名リストかどうかを見る
+      var docs = items.length ? [] : sheetToDoctors(rows);
+      impParsed.push({ sheet: names[i], items: items, doctors: docs });
+    }
+    renderSheetList();
+  } catch(e){
+    $("sheetList").innerHTML = '<div class="hint">解析に失敗: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderSheetList(){
+  if (!impParsed.length){
+    $("sheetList").innerHTML = '<div class="hint">シートが見つかりません</div>';
+    return;
+  }
+  var h = '<div class="hint">取込むシートを選んでね（シート名がマスタ名の初期値になります）。' +
+          '<b>A列に氏名だけが並ぶシートは医師マスタとして取込みます。</b></div>';
+  for (var i=0;i<impParsed.length;i++){
+    var p = impParsed[i];
+    var isDoc = (!p.items.length && p.doctors && p.doctors.length);
+    var st = 0;
+    for (var k=0;k<p.items.length;k++){ if (p.items[k].type === "sticker") st++; }
+    var usable = p.items.length || isDoc;
+    var dis = usable ? "" : " disabled";
+    var meta;
+    if (isDoc) meta = '👨‍⚕️ 医師マスタとして取込（' + p.doctors.length + ' 名）';
+    else if (p.items.length) meta = p.items.length + ' 項目' + (st ? '（うち材料シール ' + st + '）' : '');
+    else meta = '取込める行がありません';
+    h += '<div class="sheetrow">' +
+         '<input type="checkbox" data-sh="' + i + '"' + (usable?" checked":"") + dis + '>' +
+         '<div><div class="sheetname">' + esc(p.sheet) + '</div>' +
+         '<div class="sheetmeta">' + meta + '</div></div></div>';
+  }
+  $("sheetList").innerHTML = h;
+  $("impRun").disabled = false;
+}
+
+async function runImport(){
+  var boxes = $("sheetList").querySelectorAll("input[data-sh]");
+  var picked = [];
+  for (var i=0;i<boxes.length;i++){
+    if (boxes[i].checked) picked.push(impParsed[parseInt(boxes[i].getAttribute("data-sh"),10)]);
+  }
+  if (!picked.length){ alert("シートを1つ以上選んでね"); return; }
+
+  // 氏名リストのシートは医師マスタへ（既存に追加する形で統合）
+  var docPicks = [], sheetPicks = [];
+  for (var d=0;d<picked.length;d++){
+    if (!picked[d].items.length && picked[d].doctors && picked[d].doctors.length) docPicks.push(picked[d]);
+    else sheetPicks.push(picked[d]);
+  }
+  if (docPicks.length){
+    var btnD = $("impRun");
+    btnD.disabled = true; btnD.textContent = "⏳ 医師マスタ取込中…";
+    try {
+      var nowData = await api("/api/doctors");
+      var merged = (nowData.names || []).slice();
+      var before = merged.length;
+      for (var q=0;q<docPicks.length;q++){
+        for (var w=0;w<docPicks[q].doctors.length;w++) merged.push(docPicks[q].doctors[w]);
+      }
+      var saved = await api("/api/doctors", {
+        method:"POST", headers:{"content-type":"application/json"},
+        body: JSON.stringify({ names: merged })
+      });
+      var after = (saved.names || []).length;
+      toast("医師マスタ: " + after + "名（" + (after - before) + "名追加）");
+    } catch(e){
+      alert("医師マスタの取込に失敗: " + e.message);
+    }
+    btnD.disabled = false; btnD.textContent = "取込む";
+    if (!sheetPicks.length){ $("impModal").classList.add("hidden"); return; }
+  }
+  picked = sheetPicks;
+
+  // 1シートだけ → そのまま編集画面へ（保存前に微修正できる）
+  if (picked.length === 1){
+    var p = picked[0];
+    cur = { id: autoId(p.sheet), name: p.sheet, items: p.items };
+    curIsNew = true;
+    $("impModal").classList.add("hidden");
+    showEdit();
+    toast("取込みました（未保存）— 内容を確認して💾保存してね");
+    return;
+  }
+
+  // 複数シート → まとめて保存
+  var btn = $("impRun");
+  btn.disabled = true;
+  var okCount = 0, ngList = [];
+  for (var j=0;j<picked.length;j++){
+    var q = picked[j];
+    btn.textContent = "⏳ 取込中 " + (j+1) + "/" + picked.length;
+    try {
+      await api("/api/master", {
+        method:"POST", headers:{"content-type":"application/json"},
+        body: JSON.stringify({ id: autoId(q.sheet), name: q.sheet, items: q.items })
+      });
+      okCount++;
+    } catch(e){
+      ngList.push(q.sheet + "(" + e.message + ")");
+    }
+  }
+  btn.disabled = false; btn.textContent = "取込む";
+  $("impModal").classList.add("hidden");
+  loadList();
+  var msg = okCount + " 件を取込みました";
+  if (ngList.length) msg += " / 失敗: " + ngList.join(", ");
+  toast(msg);
+}
+
+// ============================================================
+// 医師マスタ
+// ============================================================
+function docLines(){
+  var raw = $("docArea").value.split(String.fromCharCode(10));
+  var out = [];
+  for (var i=0;i<raw.length;i++){
+    var t = raw[i].trim();
+    if (t) out.push(t);
+  }
+  return out;
+}
+
+function docRefreshCount(){
+  $("docCount").textContent = docLines().length + " 名";
+}
+
+async function openDoctors(){
+  $("docArea").value = "";
+  $("docCount").textContent = "読込中…";
+  $("docModal").classList.remove("hidden");
+  try {
+    var data = await api("/api/doctors");
+    $("docArea").value = (data.names || []).join(String.fromCharCode(10));
+  } catch(e){
+    alert("読込に失敗: " + e.message);
+  }
+  docRefreshCount();
+}
+
+async function saveDoctors(){
+  var btn = $("docSave");
+  btn.disabled = true; btn.textContent = "⏳ 保存中…";
+  try {
+    var data = await api("/api/doctors", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ names: docLines() })
+    });
+    $("docArea").value = (data.names || []).join(String.fromCharCode(10));
+    docRefreshCount();
+    toast("保存しました（" + (data.names || []).length + "名）");
+  } catch(e){
+    alert("保存に失敗: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "💾 保存";
+  }
+}
+
+async function onDocFile(){
+  var f = $("docFile").files[0];
+  $("docFile").value = "";
+  if (!f) return;
+  try {
+    await ensureXLSX();
+    var buf = await f.arrayBuffer();
+    var wb = window.XLSX.read(buf, { type:"array" });
+    var ws = wb.Sheets[wb.SheetNames[0]];
+    var rows = window.XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+    var names = [];
+    for (var i=0;i<rows.length;i++){
+      var v = String((rows[i] && rows[i][0]) == null ? "" : rows[i][0]).trim();
+      if (!v) continue;
+      if (i === 0 && (v.indexOf("氏名") >= 0 || v.indexOf("医師") >= 0 || v.indexOf("名前") >= 0)) continue; // 見出し行
+      names.push(v);
+    }
+    if (!names.length){ alert("A列から氏名を読み取れませんでした"); return; }
+    $("docArea").value = names.join(String.fromCharCode(10));
+    docRefreshCount();
+    toast(names.length + "名を読み込みました（保存を押すと確定）");
+  } catch(e){
+    alert("取込に失敗: " + e.message);
+  }
+}
+
+async function exportDoctors(){
+  try {
+    await ensureXLSX();
+    var names = docLines();
+    if (!names.length){ alert("書き出す氏名がありません"); return; }
+    var aoa = [["医師氏名"]];
+    for (var i=0;i<names.length;i++) aoa.push([names[i]]);
+    var wb = window.XLSX.utils.book_new();
+    var ws = window.XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{wch:24}];
+    window.XLSX.utils.book_append_sheet(wb, ws, "医師マスタ");
+    window.XLSX.writeFile(wb, "オペコピ_医師マスタ.xlsx");
+    toast("書き出しました");
+  } catch(e){
+    alert("書き出しに失敗: " + e.message);
+  }
+}
+
+// ============================================================
+// Excel書き出し（取込と同じ列構成で出すので、そのまま再取込できる）
+// ============================================================
+function outCol(it){
+  var t = it.type || "unset";
+  if (t === "fixed")   return "[[" + (it.value || "") + "]]";
+  if (t === "choice"){
+    var cs = splitList(it.choices), o = [];
+    for (var i=0;i<cs.length;i++) o.push("[[" + cs[i] + "]]");
+    return o.join("or");
+  }
+  if (t === "sticker") return "シール：確認";
+  if (t === "confirm") return "確認";
+  return "";
+}
+
+function masterToAoa(m){
+  var aoa = [["", "【JOANR各種項目】", "出力内容", "(廃止)", "読取り文字", "出力対象", "候補リスト", "材料キーワード", "除外キーワード"]];
+  var sec = null;
+  var items = m.items || [];
+  for (var i=0;i<items.length;i++){
+    var it = items[i];
+    var s2 = it.section || "";
+    if (s2 && s2 !== sec){ sec = s2; aoa.push(["", "【" + s2 + "】", "", "", "", "", "", "", ""]); }
+    aoa.push([
+      it.no || (i+1),
+      it.label || "",
+      outCol(it),
+      "",
+      it.keyword || "",
+      it.rule || "",
+      it.suggest || "",
+      splitList(it.matKeywords).join(","),
+      splitList(it.ngKeywords).join(","),
+    ]);
+  }
+  return aoa;
+}
+
+function safeSheetName(name, used){
+  var bad = [":", String.fromCharCode(92), "/", "?", "*", "[", "]"];
+  var s3 = String(name || "sheet");
+  for (var i=0;i<bad.length;i++) s3 = s3.split(bad[i]).join("_");
+  s3 = s3.slice(0, 28) || "sheet";
+  var base = s3, n = 2;
+  while (used[s3]){ s3 = (base + "_" + n).slice(0, 31); n++; }
+  used[s3] = 1;
+  return s3;
+}
+
+async function exportExcel(){
+  var btn = $("btnExport");
+  btn.disabled = true; btn.textContent = "⏳ 書き出し中…";
+  try {
+    await ensureXLSX();
+    // 管理画面はマスタ一覧をグローバルに保持していないので、ここで取り直す
+    var listData = await api("/api/masters");
+    var list = listData.masters || [];
+    if (!list.length){ alert("書き出すマスタがありません"); return; }
+    var wb = window.XLSX.utils.book_new();
+    var used = {};
+    for (var i=0;i<list.length;i++){
+      btn.textContent = "⏳ " + (i+1) + "/" + list.length;
+      var data = await api("/api/master?id=" + encodeURIComponent(list[i].id));
+      var m = data.master;
+      var ws = window.XLSX.utils.aoa_to_sheet(masterToAoa(m));
+      ws["!cols"] = [{wch:5},{wch:30},{wch:40},{wch:8},{wch:24},{wch:60},{wch:12},{wch:30},{wch:20}];
+      window.XLSX.utils.book_append_sheet(wb, ws, safeSheetName(m.name || m.id, used));
+    }
+    var d = new Date();
+    var stamp = d.getFullYear() + ("0"+(d.getMonth()+1)).slice(-2) + ("0"+d.getDate()).slice(-2);
+    window.XLSX.writeFile(wb, "オペコピ_対象用紙マスタ_" + stamp + ".xlsx");
+    toast("書き出しました");
+  } catch(e){
+    alert("書き出しに失敗: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "📤 Excel書き出し";
+  }
+}
+
+// ============================================================
+// イベント配線
+// ============================================================
+$("btnNew").addEventListener("click", newMaster);
+$("btnImport").addEventListener("click", openImport);
+$("btnReload").addEventListener("click", loadList);
+$("btnExport").addEventListener("click", exportExcel);
+$("btnDoc").addEventListener("click", openDoctors);
+$("docClose").addEventListener("click", function(){ $("docModal").classList.add("hidden"); });
+$("docSave").addEventListener("click", saveDoctors);
+$("docImport").addEventListener("click", function(){ $("docFile").click(); });
+$("docFile").addEventListener("change", onDocFile);
+$("docExport").addEventListener("click", exportDoctors);
+$("docArea").addEventListener("input", docRefreshCount);
+$("docModal").addEventListener("click", function(ev){
+  if (ev.target === $("docModal")) $("docModal").classList.add("hidden");
+});
+
+// ============================================================
+// ログイン (環境変数 PW_OPE。トークンはlocalStorageに保存)
+// ============================================================
+var AUTH_KEY = "opecopy_auth";
+function getToken(){ try { return localStorage.getItem(AUTH_KEY) || ""; } catch(e){ return ""; } }
+function setToken(t){ try { localStorage.setItem(AUTH_KEY, t); } catch(e){} }
+function clearToken(){ try { localStorage.removeItem(AUTH_KEY); } catch(e){} }
+
+function showLogin(){
+  $("loginOverlay").classList.remove("hidden");
+  setTimeout(function(){ $("loginPw").focus(); }, 50);
+}
+function hideLogin(){ $("loginOverlay").classList.add("hidden"); }
+
+async function doLogin(){
+  var btn = $("loginBtn");
+  var pw = $("loginPw").value;
+  if (!pw){ $("loginErr").textContent = "パスワードを入れてね"; return; }
+  btn.disabled = true; btn.textContent = "確認中…";
+  try {
+    var res = await fetch("/api/login", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ password: pw })
+    });
+    var data = await res.json();
+    if (!data.ok){ $("loginErr").textContent = data.error || "入れませんでした"; return; }
+    setToken(data.token || "");
+    $("loginPw").value = "";
+    $("loginErr").textContent = "";
+    hideLogin();
+    afterLogin();
+  } catch(e){
+    $("loginErr").textContent = "通信に失敗しました";
+  } finally {
+    btn.disabled = false; btn.textContent = "入る";
+  }
+}
+
+async function boot(){
+  var required = false;
+  try {
+    var r = await fetch("/api/authinfo");
+    var d = await r.json();
+    required = !!d.required;
+  } catch(e){}
+  if (required && !getToken()){ showLogin(); return; }
+  afterLogin();
+}
+
+$("loginBtn").addEventListener("click", doLogin);
+$("loginPw").addEventListener("keydown", function(ev){ if (ev.key === "Enter") doLogin(); });
+
+function afterLogin(){ loadList(); }
+
+boot();
+
+$("btnBack").addEventListener("click", function(){
+  if (!confirm("一覧に戻ります。保存していない変更は消えます。よろしい？")) return;
+  showList();
+});
+$("btnSave").addEventListener("click", saveMaster);
+$("btnAddItem").addEventListener("click", addItem);
+$("btnJson").addEventListener("click", openJson);
+
+$("impCancel").addEventListener("click", function(){ $("impModal").classList.add("hidden"); });
+$("impRun").addEventListener("click", runImport);
+$("xlFile").addEventListener("change", onXlFile);
+
+$("jsonClose").addEventListener("click", function(){ $("jsonModal").classList.add("hidden"); });
+$("jsonApply").addEventListener("click", applyJson);
+$("jsonCopy").addEventListener("click", function(){
+  var ta = $("jsonArea");
+  ta.select();
+  try { document.execCommand("copy"); toast("コピーしました"); }
+  catch(e){ alert("コピーに失敗しました"); }
+});
+
+$("impModal").addEventListener("click", function(ev){
+  if (ev.target === $("impModal")) $("impModal").classList.add("hidden");
+});
+$("jsonModal").addEventListener("click", function(ev){
+  if (ev.target === $("jsonModal")) $("jsonModal").classList.add("hidden");
+});
+
+</script>
+</body>
+</html>`;
+
+// ============================================================
+// フロント画面HTML (オペコピ本体)
+// ============================================================
+const FRONT_HTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>オペコピ</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📋</text></svg>">
+<style>
+  :root{
+    --bg:#f5f6f8; --card:#fff; --line:#e4e7ec; --ink:#2b2f36; --sub:#8a919c;
+    --accent:#f0a500; --accent2:#2aa9a0; --danger:#e5534b; --soft:#fbfcfd;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic UI",Meiryo,sans-serif;
+    font-size:14px;line-height:1.6}
+  .wrap{max-width:940px;margin:0 auto;padding:18px 16px 90px}
+  .top{display:flex;align-items:baseline;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+  .top h1{font-size:20px;margin:0}
+  .top small{color:var(--sub);font-weight:400;font-size:13px}
+  .top a{margin-left:auto;color:var(--sub);font-size:12px;text-decoration:none;border:1px solid var(--line);
+    background:#fff;border-radius:8px;padding:5px 10px}
+  .top a:hover{background:var(--soft)}
+  .hidden{display:none !important}
+
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+  .step{font-weight:700;font-size:13px;color:var(--accent2);margin-bottom:8px}
+  .hint{color:var(--sub);font-size:12px;margin:6px 0}
+
+  .btn{border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:9px;
+    padding:8px 14px;font-size:13px;font-weight:700;cursor:pointer;transition:.12s}
+  .btn:hover{background:var(--soft)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.primary:hover{opacity:.88}
+  .btn.teal{background:var(--accent2);border-color:var(--accent2);color:#fff}
+  .btn.mini{padding:4px 9px;font-size:12px;border-radius:7px}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn.big{padding:12px 22px;font-size:15px}
+
+  input[type=text],select,textarea{border:1px solid var(--line);border-radius:8px;padding:7px 9px;
+    font-size:13px;font-family:inherit;background:#fff;color:var(--ink)}
+  input[type=text]:focus,select:focus{outline:2px solid rgba(240,165,0,.35);border-color:var(--accent)}
+  select.wide{min-width:260px}
+
+  .thumbs{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:12px;margin-top:10px}
+  .th{border:2px solid var(--line);border-radius:10px;overflow:hidden;background:#fafafa}
+  .th canvas{display:block;width:100%;height:auto}
+  .th.rec{border-color:var(--accent2)}
+  .th.mat{border-color:var(--accent)}
+  .th.skip{opacity:.45}
+  .throle{display:flex;gap:2px;padding:6px;background:#fff;border-top:1px solid var(--line)}
+  .throle button{flex:1;border:0;background:#f1f3f5;color:var(--sub);border-radius:6px;padding:5px 2px;
+    font-size:11px;font-weight:700;cursor:pointer}
+  .throle button.on{background:var(--accent2);color:#fff}
+  .throle button.on.matbtn{background:var(--accent)}
+  .thnum{position:relative;font-size:11px;color:var(--sub);padding:4px 7px;background:#fff;font-weight:700}
+
+  .secline{margin:18px 0 8px;font-weight:700;color:var(--accent2);font-size:13px;
+    border-left:4px solid var(--accent2);padding-left:8px}
+  .fitem{background:#fff;border:1px solid var(--line);border-radius:10px;padding:9px 11px;margin-bottom:7px;
+    display:flex;gap:9px;align-items:center;flex-wrap:wrap}
+  .flabel{min-width:210px;font-weight:700;font-size:13px}
+  .ficon{font-size:12px;margin-right:3px}
+  .fval{flex:1;min-width:200px}
+  .fval input,.fval select{width:100%}
+  .fitem.empty .flabel{color:var(--sub)}
+  .fitem.empty{background:#fcfcfd}
+  .tag{font-size:10px;border-radius:5px;padding:1px 6px;font-weight:700;background:#eef1f4;color:var(--sub)}
+  .tag.fx{background:#eef7ff;color:#2b6cb0}
+  .tag.st{background:#fff3e0;color:#b26a00}
+  .tag.cf{background:#fdf3f2;color:#b3453e}
+
+  .prodbox{border:1px solid var(--line);border-radius:8px;padding:7px 8px;margin-bottom:6px;background:#fbfcfd;width:100%}
+  .prodhead{font-size:11px;font-weight:700;color:var(--accent2);margin-bottom:4px}
+  .prodrow{display:flex;gap:5px;align-items:center;margin-bottom:4px}
+  .prodlbl{font-size:11px;color:var(--sub);font-weight:700;min-width:74px}
+  .prodrow input{flex:1;min-width:0;font-size:12.5px;padding:5px 7px}
+  .prodref{font-size:11px;color:var(--sub);font-family:ui-monospace,Menlo,Consolas,monospace;margin-top:2px}
+  .matline{font-size:12px;color:var(--sub);margin-top:3px;width:100%;
+    font-family:ui-monospace,Menlo,Consolas,monospace}
+  .stickers{margin-top:8px}
+  .strow{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border:1px solid var(--line);
+    border-radius:9px;margin-bottom:6px;background:#fff}
+  .strow.un{border-style:dashed;background:#fffdf7}
+  .sttitle{font-weight:700;font-size:13px}
+  .stmeta{font-size:12px;color:var(--sub);font-family:ui-monospace,Menlo,Consolas,monospace}
+  .stassign{font-size:11px;color:var(--accent2);font-weight:700}
+  .stassign.none{color:#b26a00}
+  .warnbox{background:#fff8ec;border:1px solid #f3dcae;border-radius:9px;padding:9px 12px;font-size:12px;margin-bottom:10px}
+
+  .sticky{position:fixed;left:0;right:0;bottom:0;background:rgba(255,255,255,.96);
+    border-top:1px solid var(--line);padding:10px 16px;display:flex;gap:9px;justify-content:center;
+    backdrop-filter:blur(6px);z-index:50}
+
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:999;display:flex;
+    align-items:center;justify-content:center;padding:16px}
+  .modal{background:#fff;border-radius:14px;max-width:620px;width:100%;max-height:88vh;
+    display:flex;flex-direction:column;overflow:hidden;box-shadow:0 14px 44px rgba(0,0,0,.28)}
+  .mhead{padding:14px 16px;font-weight:700;border-bottom:1px solid var(--line)}
+  .mbody{padding:14px 16px;overflow:auto}
+  .mfoot{padding:12px 16px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:flex-end}
+  .kcrow{border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin-bottom:7px;cursor:pointer;background:#fff}
+  .kcrow:hover{background:var(--soft);border-color:var(--accent)}
+  .kcname{font-weight:700;font-size:13px}
+  .kcmeta{font-size:12px;color:var(--sub);font-family:ui-monospace,Menlo,Consolas,monospace;margin-top:2px}
+  .kcreason{font-size:11px;color:var(--accent2);font-weight:700;margin-top:2px}
+  /* ▼▼ ログイン ▼▼ */
+  #loginOverlay{position:fixed;inset:0;z-index:200;background:rgba(243,245,247,.92);
+    backdrop-filter:blur(3px);display:flex;align-items:flex-start;justify-content:center;padding:24px 16px}
+  #loginOverlay.hidden{display:none}
+  #loginOverlay .logincard{background:#fff;border:1px solid var(--line);border-radius:12px;
+    padding:22px 20px;max-width:380px;width:100%;margin-top:60px;text-align:center;
+    box-shadow:0 8px 30px rgba(0,0,0,.10)}
+  #loginOverlay .login-emoji{font-size:32px}
+  #loginOverlay .login-title{font-size:17px;font-weight:700;margin:8px 0 14px}
+  #loginPw{width:100%;text-align:center;font-size:16px;padding:11px 10px;margin-bottom:10px}
+  #loginBtn{display:block;width:100%;font-size:15px;font-weight:700;padding:12px 0;border:none;
+    border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+  #loginBtn:hover{opacity:.9}
+  #loginErr{color:var(--danger);font-size:12.5px;font-weight:700;margin-top:10px;min-height:18px}
+  /* ▲▲ ログインここまで ▲▲ */
+
+  /* ▼▼ 位置情報ゲート(開始前ロック) ▼▼ */
+  #gateOverlay{position:fixed;inset:0;z-index:50;background:rgba(243,245,247,.72);
+    backdrop-filter:blur(2px);display:flex;align-items:flex-start;justify-content:center;padding:24px 16px}
+  #gateOverlay .gatecard{background:var(--card);border:1px solid var(--line);border-radius:12px;
+    padding:20px 18px;max-width:420px;width:100%;margin-top:40px;
+    box-shadow:0 8px 30px rgba(0,0,0,.10);text-align:center}
+  #gateOverlay .gate-emoji{font-size:34px}
+  #gateOverlay .gate-title{font-size:17px;font-weight:700;margin:8px 0 6px}
+  #gateOverlay .gate-note{font-size:12.5px;color:var(--sub);line-height:1.9;margin-bottom:14px}
+  #gateStartBtn{display:block;width:100%;font-size:15px;font-weight:700;padding:13px 0;border:none;
+    border-radius:10px;background:var(--accent);color:#fff;cursor:pointer}
+  #gateStartBtn:hover{opacity:.9}
+  #gateDone{font-size:13.5px;color:var(--accent);font-weight:700;line-height:1.8}
+  body.locked .wrap{filter:grayscale(.6) opacity(.5);pointer-events:none;user-select:none}
+  body.locked .sticky{display:none}
+  /* ▲▲ 位置情報ゲートここまで ▲▲ */
+
+  /* ▼▼ サイドバー等の狭い幅向け(拡張のiframeは400px前後) ▼▼ */
+  @media (max-width: 620px){
+    .wrap{padding:12px 10px 92px}
+    .top h1{font-size:18px}
+    .top a{margin-left:0}
+    .card{padding:11px}
+    .fitem{gap:5px}
+    .flabel{min-width:0;width:100%}
+    .fval{min-width:0;width:100%}
+    select.wide{min-width:0;width:100%}
+    .thumbs{grid-template-columns:repeat(auto-fill,minmax(105px,1fr));gap:8px}
+    .throle button{font-size:10px;padding:4px 1px}
+    .modal{max-width:100%}
+    .sticky{padding:8px 10px}
+    .btn.big{padding:11px 16px;font-size:14px}
+    .secline{margin:14px 0 6px}
+    #gateOverlay .gatecard,#loginOverlay .logincard{margin-top:18px;padding:16px 14px}
+  }
+  /* ▲▲ 狭い幅向けここまで ▲▲ */
+  .toast{position:fixed;left:50%;bottom:80px;transform:translateX(-50%);background:#2b2f36;color:#fff;
+    padding:10px 18px;border-radius:10px;font-size:13px;font-weight:700;z-index:2000;opacity:0;
+    transition:opacity .2s;pointer-events:none}
+  .toast.show{opacity:1}
+  .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(0,0,0,.15);
+    border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .prog{text-align:center;color:var(--sub);padding:22px}
+</style>
+</head>
+<body class="locked">
+
+<!-- ▼▼ 位置情報ゲート(開始前オーバーレイ) ▼▼ -->
+<div id="gateOverlay">
+  <div class="gatecard">
+    <div class="gate-emoji">📍</div>
+    <div class="gate-title">位置情報を送信して入力開始</div>
+    <div class="gate-note">
+      🏥 このツールは<b>病院の中</b>で使ってね！<br>
+      🗒️ 開始すると<b>位置情報が利用記録として送信・保存</b>されるよ<br>
+      🙏 持ち帰り防止のための記録だから協力してね💕
+    </div>
+    <button id="gateStartBtn">📍 位置情報を送信して入力開始</button>
+    <div id="gateDone" style="display:none">✅ 位置情報が送信されました。<br>入力を始めて下さい🖊️</div>
+  </div>
+</div>
+<!-- ▲▲ 位置情報ゲートここまで ▲▲ -->
+
+<div class="wrap">
+
+  <div class="top">
+    <h1>📋 オペコピ</h1>
+    <small>手術記録用紙 → JOANR入力補助</small>
+    <a href="/admin">⚙️ 管理画面</a>
+  </div>
+
+  <!-- STEP 1 -->
+  <div class="card">
+    <div class="step">STEP 1 — 対象用紙を選ぶ</div>
+    <select id="masterSel" class="wide"><option value="">読込中…</option></select>
+    <div class="hint" id="masterInfo"></div>
+  </div>
+
+  <!-- STEP 2 -->
+  <div class="card">
+    <div class="step">STEP 2 — 手術記録PDFを読み込む</div>
+    <input type="file" id="pdfFile" accept="application/pdf,image/*">
+    <div class="hint">
+      各ページの役割を選んでね。<b>「送らない」にしたページはAIに送信されません</b>（個人情報の載る面を外せます）。
+    </div>
+    <div class="thumbs" id="thumbs"></div>
+  </div>
+
+  <!-- STEP 3 -->
+  <div class="card" id="runCard">
+    <div class="step">STEP 3 — 読み取り</div>
+    <button class="btn primary big" id="btnRun" disabled>🚀 読み取り実行</button>
+    <span class="hint" id="runHint"></span>
+  </div>
+
+  <!-- 結果 -->
+  <div id="resultArea"></div>
+
+</div>
+
+<div class="sticky hidden" id="stickyBar">
+  <button class="btn teal" id="btnCopyAll">📋 全体をコピー</button>
+  <button class="btn" id="btnReset">🧹 やり直す</button>
+</div>
+
+<!-- 医師マスタ選択モーダル -->
+<div class="overlay hidden" id="dcModal">
+  <div class="modal">
+    <div class="mhead">👨‍⚕️ 医師マスタから選ぶ</div>
+    <div class="mbody">
+      <div class="hint">名前をタップで置き換え、＋追加で複数名にできます（助手用）。</div>
+      <input type="text" id="dcFilter" style="width:100%" placeholder="絞り込み（姓の一部でOK）">
+      <div id="dcList" style="margin-top:10px"></div>
+    </div>
+    <div class="mfoot"><button class="btn" id="dcClose">閉じる</button></div>
+  </div>
+</div>
+
+<!-- 術式候補モーダル -->
+<div class="overlay hidden" id="kcModal">
+  <div class="modal">
+    <div class="mhead">🔍 登録術式の候補</div>
+    <div class="mbody">
+      <div class="hint">読み取った術式名に近い登録術式を、近い順に表示します。選ぶとその欄に反映されます。</div>
+      <input type="text" id="kcQuery" style="width:100%" placeholder="術式名">
+      <div style="margin-top:8px"><button class="btn" id="kcSearch">この内容で検索</button></div>
+      <div id="kcList" style="margin-top:12px"></div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="kcClose">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<!-- ▼▼ ログイン ▼▼ -->
+<div id="loginOverlay" class="hidden">
+  <div class="logincard">
+    <div class="login-emoji">🔐</div>
+    <div class="login-title">オペコピ</div>
+    <input type="password" id="loginPw" placeholder="パスワード" autocomplete="current-password">
+    <button id="loginBtn">入る</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
+<!-- ▲▲ ログインここまで ▲▲ -->
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ============================================================
+// 状態
+// ============================================================
+var masters = [];
+var curMaster = null;     // 抽出後に確定するマスタ本体
+var pages = [];           // {pdfPage|img, role:"rec"|"mat"|"skip", num}
+var pdfDoc = null;
+var results = {};         // no -> 値
+var labels = [];          // 確定した材料シール
+var labelObs = [];        // 各タイルからの生の観測(多数決の材料)
+var usedTokens = 0;       // 今回使ったトークン合計
+var disagree = {};        // 複数回の読み取りが一致しなかった項目 no -> [候補...]
+var failedShots = 0;      // 読み取りに失敗した領域の数
+var assignMap = {};       // no -> [labelIndex,...]
+
+var TYPE_ICON = { ocr:"🔍", choice:"☑️", fixed:"📌", sticker:"🏷️", confirm:"❓", unset:"⬜" };
+
+// ============================================================
+// ユーティリティ
+// ============================================================
+function $(id){ return document.getElementById(id); }
+function esc(s){
+  return String(s == null ? "" : s)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+var NL = String.fromCharCode(10);
+
+function toast(msg){
+  var t = $("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(function(){ t.classList.remove("show"); }, 2200);
+}
+
+async function api(path, opt){
+  opt = opt || {};
+  var h = {};
+  if (opt.headers){ for (var k in opt.headers) h[k] = opt.headers[k]; }
+  var t = getToken();
+  if (t) h["x-ope-auth"] = t;
+  opt.headers = h;
+  var res = await fetch(path, opt);
+  if (res.status === 401){ clearToken(); showLogin(); throw new Error("認証が必要です"); }
+  var data = await res.json();
+  if (!data.ok) throw new Error(data.error || "APIエラー");
+  return data;
+}
+
+function copyText(s){
+  if (navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(s).then(function(){ toast("コピーしました"); },
+      function(){ fallbackCopy(s); });
+  } else fallbackCopy(s);
+}
+function fallbackCopy(s){
+  var ta = document.createElement("textarea");
+  ta.value = s;
+  ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand("copy"); toast("コピーしました"); }
+  catch(e){ toast("コピーに失敗しました"); }
+  document.body.removeChild(ta);
+}
+
+// ============================================================
+// pdf.js
+// ============================================================
+var pdfJsLoading = null;
+function ensurePdfJs(){
+  if (window.pdfjsLib) return Promise.resolve();
+  if (pdfJsLoading) return pdfJsLoading;
+  pdfJsLoading = new Promise(function(resolve, reject){
+    var s = document.createElement("script");
+    s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+    s.onload = function(){
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+        "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+      resolve();
+    };
+    s.onerror = function(){ pdfJsLoading = null; reject(new Error("PDFライブラリの読み込みに失敗しました")); };
+    document.head.appendChild(s);
+  });
+  return pdfJsLoading;
+}
+
+async function renderPage(pageObj, maxDim, quality){
+  if (pageObj.img){
+    var img = pageObj.img;
+    var sc = Math.min(1, maxDim / Math.max(img.width, img.height));
+    var c = document.createElement("canvas");
+    c.width = Math.round(img.width * sc);
+    c.height = Math.round(img.height * sc);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    return c.toDataURL("image/jpeg", quality);
+  }
+  var page = pageObj.pdfPage;
+  var base = page.getViewport({ scale: 1 });
+  var scale = maxDim / Math.max(base.width, base.height);
+  var vp = page.getViewport({ scale: scale });
+  var canvas = document.createElement("canvas");
+  canvas.width = Math.round(vp.width);
+  canvas.height = Math.round(vp.height);
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+  return canvas.toDataURL("image/jpeg", quality);
+}
+
+// ---------- シール面はタイル分割して読む(密集ラベルの読み落とし・混線対策) ----------
+var TILE_COLS = 2, TILE_ROWS = 2, TILE_OVERLAP = 0.15, TILE_ALSO_FULL = true;
+// 記録面は「全面 + 横帯」で送る。
+//   A4全面のまま送るとOpenAI側で短辺768pxまで縮小され、手書きの○が潰れる。
+//   横に細長い帯にすると短辺が高さ側になるため、横方向の実効解像度が約3倍になる。
+var RECORD_BANDS = 3;          // 0 か 1 で分割なし
+var RECORD_BAND_OVERLAP = 0.12;  // 帯の重なり。全面を送らないぶん広めに取る
+var SEND_FULL_PAGE = false;      // 記録面で「全面」も送るか(サーバー側の同名設定と揃える)
+var LABEL_CONCURRENCY = 2;
+
+async function renderPageCanvas(pageObj, maxDim){
+  if (pageObj.img){
+    var img = pageObj.img;
+    var sc = Math.min(1, maxDim / Math.max(img.width, img.height));
+    var c = document.createElement("canvas");
+    c.width = Math.round(img.width * sc);
+    c.height = Math.round(img.height * sc);
+    c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+    return c;
+  }
+  var page = pageObj.pdfPage;
+  var base = page.getViewport({ scale: 1 });
+  var scale = maxDim / Math.max(base.width, base.height);
+  var vp = page.getViewport({ scale: scale });
+  var canvas = document.createElement("canvas");
+  canvas.width = Math.round(vp.width);
+  canvas.height = Math.round(vp.height);
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+  return canvas;
+}
+
+function canvasToDataURL(canvas, maxDim, q){
+  var sc = Math.min(1, maxDim / Math.max(canvas.width, canvas.height));
+  if (sc >= 1) return canvas.toDataURL("image/jpeg", q);
+  var t = document.createElement("canvas");
+  t.width = Math.round(canvas.width * sc);
+  t.height = Math.round(canvas.height * sc);
+  t.getContext("2d").drawImage(canvas, 0, 0, t.width, t.height);
+  return t.toDataURL("image/jpeg", q);
+}
+
+function tileCanvas(canvas, cols, rows, ov, maxDim, q){
+  var out = [];
+  var tw = canvas.width / cols, th = canvas.height / rows;
+  var ox = tw * ov, oy = th * ov;
+  for (var r=0;r<rows;r++){
+    for (var c=0;c<cols;c++){
+      var x0 = Math.max(0, c*tw - ox), y0 = Math.max(0, r*th - oy);
+      var x1 = Math.min(canvas.width,  (c+1)*tw + ox);
+      var y1 = Math.min(canvas.height, (r+1)*th + oy);
+      var w = x1-x0, h = y1-y0;
+      var sc = Math.min(1, maxDim / Math.max(w,h));
+      var t = document.createElement("canvas");
+      t.width = Math.round(w*sc); t.height = Math.round(h*sc);
+      t.getContext("2d").drawImage(canvas, x0,y0,w,h, 0,0,t.width,t.height);
+      out.push(t.toDataURL("image/jpeg", q));
+    }
+  }
+  return out;
+}
+
+function normTitle(t){
+  var parts = String(t||"").toLowerCase().split(" ");
+  var o = [];
+  for (var i=0;i<parts.length;i++){ var x = parts[i].trim(); if (x) o.push(x); }
+  return o.join(" ");
+}
+
+// REF/SN/LOT が一致すれば同一シールとみなす(タイルの重なり分を統合)
+function labelKey(l){
+  var k = String(l.ref||"").trim() + "|" + String(l.sn||"").trim() + "|" + String(l.lot||"").trim();
+  if (k === "||") return "T:" + normTitle(l.title);
+  return k;
+}
+
+// 表記ゆれを落とした比較用タイトル
+function normTitleKey(t){
+  var s = String(t||"").toLowerCase(), out = "";
+  for (var i=0;i<s.length;i++){
+    var c = s.charAt(i);
+    out += ((c>="a"&&c<="z")||(c>="0"&&c<="9")) ? c : " ";
+  }
+  var parts = out.split(" "), o = [];
+  for (var j=0;j<parts.length;j++){
+    var w = parts[j].trim();
+    if (!w) continue;
+    if (w === "equinox") w = "equinoxe";   // EQUINOX / EQUINOXE のゆれ
+    o.push(w);
+  }
+  return o.join(" ");
+}
+
+// 短い編集距離(1文字違いのSN誤読を同一視するため)
+function editDist(a,b){
+  a = String(a||""); b = String(b||"");
+  var m = a.length, n = b.length;
+  if (Math.abs(m-n) > 2) return 99;
+  var prev = [], cur = [], i, j;
+  for (j=0;j<=n;j++) prev[j] = j;
+  for (i=1;i<=m;i++){
+    cur[0] = i;
+    for (j=1;j<=n;j++){
+      var cost = (a.charAt(i-1) === b.charAt(j-1)) ? 0 : 1;
+      cur[j] = Math.min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost);
+    }
+    for (var k=0;k<=n;k++) prev[k] = cur[k];
+  }
+  return prev[n];
+}
+
+// タイトルの単語集合の重なり(Jaccard)で近さを測る。
+// strict schema導入で製品名の表記ゆれが増えたため、前方一致では拾えない
+function titleSimilar(a, b){
+  var ta = normTitleKey(a.title).split(" ");
+  var tb = normTitleKey(b.title).split(" ");
+  if (!ta.length || !tb.length) return false;
+  var setA = {}, i;
+  for (i=0;i<ta.length;i++) if (ta[i]) setA[ta[i]] = 1;
+  var inter = 0, seen = {};
+  for (i=0;i<tb.length;i++){
+    var w = tb[i];
+    if (!w || seen[w]) continue;
+    seen[w] = 1;
+    if (setA[w]) inter++;
+  }
+  var nA = 0; for (var k in setA) nA++;
+  var nB = 0; for (var k2 in seen) nB++;
+  var uni = nA + nB - inter;
+  if (!uni) return false;
+  return (inter / uni) >= 0.55;
+}
+
+function snOf(x){ return String(x.sn||"").trim().toUpperCase(); }
+function refOf(x){ return String(x.ref||"").trim().toUpperCase(); }
+
+// 同じシールの別観測か？
+//   SNは個体固有なので最優先の識別子。ただし1〜2文字の読み違いは起こるため、
+//   REFが一致していれば軽微なズレは同一個体とみなす。
+function sameSticker(a, b){
+  var sa = snOf(a), sb = snOf(b);
+  if (sa && sb){
+    var d = editDist(sa, sb);
+    if (d === 0) return titleSimilar(a, b);
+    var ra = refOf(a), rb = refOf(b);
+    if (d <= 2 && ra && rb && ra === rb) return titleSimilar(a, b);
+    return false;                       // SNが明確に違う = 別個体
+  }
+  if (!titleSimilar(a, b)) return false;
+  var ra2 = refOf(a), rb2 = refOf(b);
+  if (ra2 && rb2) return ra2 === rb2;   // REFが違えば別製品
+  return true;
+}
+
+// 観測群から最頻値を採る(同数なら長い方)
+function voteField(obs, f){
+  var counts = {}, best = "", bestN = 0;
+  for (var i=0;i<obs.length;i++){
+    var v = String(obs[i][f]||"").trim();
+    if (!v) continue;
+    counts[v] = (counts[v]||0) + 1;
+    if (counts[v] > bestN || (counts[v] === bestN && v.length > best.length)){ best = v; bestN = counts[v]; }
+  }
+  return best;
+}
+
+// 全観測をクラスタ化し、各項目を多数決で確定する
+function consolidate(obs){
+  var clusters = [];
+  for (var i=0;i<obs.length;i++){
+    var o = obs[i];
+    if (!o || !o.title) continue;
+    var placed = false;
+    for (var c=0;c<clusters.length;c++){
+      for (var m=0;m<clusters[c].length;m++){
+        if (sameSticker(clusters[c][m], o)){ clusters[c].push(o); placed = true; break; }
+      }
+      if (placed) break;
+    }
+    if (!placed) clusters.push([o]);
+  }
+  var out = [];
+  for (var k=0;k<clusters.length;k++){
+    var g = clusters[k];
+    var rec = {
+      title: voteField(g,"title"),
+      gtin:  voteField(g,"gtin"),
+      ref:   voteField(g,"ref"),
+      lot:   voteField(g,"lot"),
+      sn:    voteField(g,"sn"),
+      exp:   voteField(g,"exp"),
+      maker: voteField(g,"maker"),
+      gtinRaw: voteField(g,"gtinRaw"),
+      seen:  g.length
+    };
+    // 採用した値と同じ観測からフラグを引き継ぐ
+    rec.gtinNg = false; rec.expNg = false;
+    for (var q=0;q<g.length;q++){
+      if (rec.gtin && String(g[q].gtin||"") === rec.gtin && g[q].gtinNg) rec.gtinNg = true;
+      if (rec.exp  && String(g[q].exp||"")  === rec.exp  && g[q].expNg)  rec.expNg  = true;
+    }
+    // 観測が1回だけ = 他のタイルで裏が取れていない
+    rec.lowConf = (g.length === 1);
+    // 同じ個体なのにSNの読みが揺れた = SNを鵜呑みにできない
+    rec.snVaried = false;
+    for (var v=0;v<g.length;v++){
+      var sv = String(g[v].sn||"").trim().toUpperCase();
+      if (sv && rec.sn && sv !== String(rec.sn).toUpperCase()) rec.snVaried = true;
+    }
+    out.push(rec);
+  }
+  return out;
+}
+
+// ============================================================
+// STEP1 マスタ
+// ============================================================
+async function loadMasters(){
+  try {
+    var data = await api("/api/masters");
+    masters = data.masters || [];
+    var sel = $("masterSel");
+    if (!masters.length){
+      sel.innerHTML = '<option value="">（マスタ未登録 — 管理画面で登録してね）</option>';
+      return;
+    }
+    var h = '<option value="">— 選んでください —</option>';
+    for (var i=0;i<masters.length;i++){
+      h += '<option value="' + esc(masters[i].id) + '">' + esc(masters[i].name) + '</option>';
+    }
+    sel.innerHTML = h;
+    if (masters.length === 1){ sel.value = masters[0].id; onMasterChange(); }
+  } catch(e){
+    $("masterSel").innerHTML = '<option value="">読込失敗: ' + esc(e.message) + '</option>';
+  }
+}
+
+function onMasterChange(){
+  var id = $("masterSel").value;
+  var info = "";
+  for (var i=0;i<masters.length;i++){
+    if (masters[i].id === id){
+      info = masters[i].count + " 項目";
+      if (masters[i].stickerTodo > 0) info += "　⚠️ 材料キーワード未設定 " + masters[i].stickerTodo + "件（シール自動割当が効きません）";
+      break;
+    }
+  }
+  $("masterInfo").textContent = info;
+  updateRunBtn();
+}
+
+// ============================================================
+// STEP2 ページ読込・役割選択
+// ============================================================
+async function onFile(){
+  var f = $("pdfFile").files[0];
+  if (!f) return;
+  $("thumbs").innerHTML = '<div class="prog"><span class="spin"></span> 読込中…</div>';
+  pages = []; pdfDoc = null;
+  try {
+    if (f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")){
+      await ensurePdfJs();
+      var buf = await f.arrayBuffer();
+      pdfDoc = await window.pdfjsLib.getDocument({ data: buf }).promise;
+      for (var i=1;i<=pdfDoc.numPages;i++){
+        var pg = await pdfDoc.getPage(i);
+        pages.push({ pdfPage: pg, num: i, role: (i === pdfDoc.numPages ? "mat" : "rec") });
+      }
+    } else {
+      var img = await loadImg(f);
+      pages.push({ img: img, num: 1, role: "rec" });
+    }
+    await renderThumbs();
+  } catch(e){
+    $("thumbs").innerHTML = '<div class="prog">読込失敗: ' + esc(e.message) + '</div>';
+  }
+  updateRunBtn();
+}
+
+function loadImg(file){
+  return new Promise(function(resolve, reject){
+    var url = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = function(){ URL.revokeObjectURL(url); reject(new Error("画像を読み込めませんでした")); };
+    img.src = url;
+  });
+}
+
+async function renderThumbs(){
+  var box = $("thumbs");
+  box.innerHTML = "";
+  for (var i=0;i<pages.length;i++){
+    var p = pages[i];
+    var div = document.createElement("div");
+    div.className = "th " + p.role;
+    div.setAttribute("data-i", i);
+
+    var num = document.createElement("div");
+    num.className = "thnum";
+    num.textContent = "P" + p.num;
+    div.appendChild(num);
+
+    var c = document.createElement("canvas");
+    if (p.img){
+      var sc = 240 / Math.max(p.img.width, p.img.height);
+      c.width = Math.round(p.img.width * sc);
+      c.height = Math.round(p.img.height * sc);
+      c.getContext("2d").drawImage(p.img, 0, 0, c.width, c.height);
+    } else {
+      var base = p.pdfPage.getViewport({ scale: 1 });
+      var scale = 240 / Math.max(base.width, base.height);
+      var vp = p.pdfPage.getViewport({ scale: scale });
+      c.width = Math.round(vp.width);
+      c.height = Math.round(vp.height);
+      await p.pdfPage.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+    }
+    div.appendChild(c);
+
+    var roles = document.createElement("div");
+    roles.className = "throle";
+    roles.innerHTML =
+      '<button data-r="rec" data-i="' + i + '">記録面</button>' +
+      '<button data-r="mat" data-i="' + i + '" class="matbtn">シール面</button>' +
+      '<button data-r="skip" data-i="' + i + '">送らない</button>';
+    div.appendChild(roles);
+    box.appendChild(div);
+  }
+  syncRoleButtons();
+  var bs = box.querySelectorAll(".throle button");
+  for (var j=0;j<bs.length;j++){
+    bs[j].addEventListener("click", function(ev){
+      var el = ev.currentTarget;
+      var idx = parseInt(el.getAttribute("data-i"),10);
+      pages[idx].role = el.getAttribute("data-r");
+      syncRoleButtons();
+      updateRunBtn();
+    });
+  }
+}
+
+function syncRoleButtons(){
+  var box = $("thumbs");
+  var cards = box.querySelectorAll(".th");
+  for (var i=0;i<cards.length;i++){
+    var idx = parseInt(cards[i].getAttribute("data-i"),10);
+    var role = pages[idx].role;
+    cards[i].className = "th " + role;
+    var bs = cards[i].querySelectorAll(".throle button");
+    for (var j=0;j<bs.length;j++){
+      var on = bs[j].getAttribute("data-r") === role;
+      bs[j].className = (bs[j].getAttribute("data-r") === "mat" ? "matbtn " : "") + (on ? "on" : "");
+    }
+  }
+}
+
+function updateRunBtn(){
+  var hasMaster = !!$("masterSel").value;
+  var hasPage = false;
+  for (var i=0;i<pages.length;i++){ if (pages[i].role !== "skip"){ hasPage = true; break; } }
+  $("btnRun").disabled = !(hasMaster && hasPage);
+  var rec = 0, mat = 0;
+  for (var j=0;j<pages.length;j++){
+    if (pages[j].role === "rec") rec++;
+    if (pages[j].role === "mat") mat++;
+  }
+  $("runHint").textContent = pages.length ? ("記録面 " + rec + "ページ / シール面 " + mat + "ページ を送信") : "";
+}
+
+// ============================================================
+// STEP3 実行
+// ============================================================
+async function run(){
+  var masterId = $("masterSel").value;
+  if (!masterId) return;
+
+  var btn = $("btnRun");
+  btn.disabled = true;
+  results = {}; labels = []; labelObs = []; assignMap = {}; usedTokens = 0; failedShots = 0; disagree = {}; snapped = {}; kcPicked = {}; doctorInfo = null; subVals = {};
+  $("resultArea").innerHTML = '<div class="card prog"><span class="spin"></span> <span id="progMsg">準備中…</span></div>';
+
+  try {
+    var recPages = [], matPages = [];
+    for (var i=0;i<pages.length;i++){
+      if (pages[i].role === "rec") recPages.push(pages[i]);
+      if (pages[i].role === "mat") matPages.push(pages[i]);
+    }
+
+    var doneRec = 0, doneMat = 0, totalMat = 0;
+    function prog(){
+      var p = [];
+      if (recPages.length) p.push("記録面 " + (doneRec ? "読み取り完了" : "読み取り中…"));
+      if (totalMat) p.push("シール " + doneMat + "/" + totalMat);
+      setProg(p.join("　／　") || "読み取り中…");
+    }
+
+    // --- 記録面 ---
+    async function jobRecord(){
+      if (!recPages.length){
+        var mm = await api("/api/master?id=" + encodeURIComponent(masterId));
+        curMaster = mm.master;
+        for (var f=0; f<curMaster.items.length; f++){
+          var itf = curMaster.items[f];
+          if (itf.type === "fixed") results[String(itf.no)] = itf.value || "";
+        }
+        return;
+      }
+      var imgs = [];
+      for (var r=0;r<recPages.length;r++){
+        var rbig = await renderPageCanvas(recPages[r], 2400);
+        if (SEND_FULL_PAGE) imgs.push({ num: recPages[r].num, image: canvasToDataURL(rbig, 2000, 0.9) });
+        if (RECORD_BANDS > 1){
+          var bands = tileCanvas(rbig, 1, RECORD_BANDS, RECORD_BAND_OVERLAP, 4000, 0.92);
+          for (var b=0;b<bands.length;b++) imgs.push({ num: recPages[r].num, image: bands[b] });
+        }
+      }
+      var ex = await api("/api/extract", {
+        method:"POST", headers:{"content-type":"application/json"},
+        body: JSON.stringify({ masterId: masterId, pages: imgs })
+      });
+      results = ex.results || {};
+      curMaster = ex.master;
+      disagree = ex.disagree || {};
+      snapped = ex.snapped || {};
+      doctorInfo = ex.doctorInfo || null;
+      if (ex.usage && ex.usage.total_tokens) usedTokens += ex.usage.total_tokens;
+      doneRec = 1;
+    }
+
+    // --- シール面(タイルを並行で読む) ---
+    async function jobStickers(){
+      for (var m=0;m<matPages.length;m++){
+        var big = await renderPageCanvas(matPages[m], 3000);
+        var shots = tileCanvas(big, TILE_COLS, TILE_ROWS, TILE_OVERLAP, 2000, 0.92);
+        if (TILE_ALSO_FULL) shots.push(canvasToDataURL(big, 2200, 0.9));
+        totalMat += shots.length;
+        prog();
+        var tasks = shots.map(function(img){
+          return async function(){
+            try {
+              var lb = await api("/api/label", {
+                method:"POST", headers:{"content-type":"application/json"},
+                body: JSON.stringify({ image: img })
+              });
+              if (lb.usage && lb.usage.total_tokens) usedTokens += lb.usage.total_tokens;
+              var arr = lb.items || [];
+              for (var z=0;z<arr.length;z++) labelObs.push(arr[z]);
+            } catch(err){
+              failedShots++;
+              console.warn("領域の読み取りに失敗", err);
+            }
+            doneMat++;
+            prog();
+          };
+        });
+        await runPool(tasks, LABEL_CONCURRENCY);
+      }
+    }
+
+    // 揃った分から画面に出す(記録面が来た時点で一度描画し、シールが揃ったら描き直す)
+    function renderPartial(){
+      if (!curMaster) return;
+      labels = consolidate(labelObs);
+      assignStickers();
+      buildSubVals();
+      renderResults();
+      $("stickyBar").classList.remove("hidden");
+    }
+
+    prog();
+    var pRec = jobRecord().then(function(){ prog(); renderPartial(); });
+    var pMat = jobStickers().then(function(){ prog(); });
+    await Promise.all([pRec, pMat]);
+
+    renderPartial();
+  } catch(e){
+    $("resultArea").innerHTML = '<div class="card">読み取りに失敗しました: ' + esc(e.message) + '</div>';
+  } finally {
+    btn.disabled = false;
+    updateRunBtn();
+  }
+}
+
+function sleep(ms){ return new Promise(function(r){ setTimeout(r, ms); }); }
+
+// 同時実行数を制限しながら並行に走らせる
+async function runPool(tasks, limit){
+  var out = new Array(tasks.length);
+  var next = 0;
+  var n = Math.min(Math.max(1, limit), tasks.length);
+  var workers = [];
+  for (var w=0; w<n; w++){
+    workers.push((async function(){
+      while (true){
+        var my = next++;
+        if (my >= tasks.length) break;
+        out[my] = await tasks[my]();
+      }
+    })());
+  }
+  await Promise.all(workers);
+  return out;
+}
+
+function setProg(msg){
+  var el = $("progMsg");
+  if (el) el.textContent = msg;
+}
+
+// ============================================================
+// 材料シールの割当
+//   matKeywords にヒット、かつ ngKeywords に当たらないものを割当
+// ============================================================
+function assignStickers(){
+  assignMap = {};
+  var used = {};
+  for (var i=0;i<curMaster.items.length;i++){
+    var it = curMaster.items[i];
+    if (it.type !== "sticker") continue;
+    var kws = it.matKeywords || [];
+    var ngs = it.ngKeywords || [];
+    var hits = [];
+    for (var j=0;j<labels.length;j++){
+      var t = String(labels[j].title || "").toLowerCase();
+      if (!t) continue;
+      var hit = false;
+      for (var k=0;k<kws.length;k++){
+        var kw = String(kws[k]||"").toLowerCase().trim();
+        if (kw && t.indexOf(kw) >= 0){ hit = true; break; }
+      }
+      if (!hit) continue;
+      var ng = false;
+      for (var n=0;n<ngs.length;n++){
+        var nk = String(ngs[n]||"").toLowerCase().trim();
+        if (nk && t.indexOf(nk) >= 0){ ng = true; break; }
+      }
+      if (ng) continue;
+      hits.push(j);
+      used[j] = true;
+    }
+    assignMap[String(it.no)] = hits;
+  }
+  for (var u=0;u<labels.length;u++) labels[u].unassigned = !used[u];
+}
+
+// JOANRのコンポーネント入力欄(カタログNo/メーカー名/商品名/ロットNo)に合わせて分解する
+function labelToSub(l){
+  return { catalog: l.ref || "", maker: l.maker || "", name: l.title || "",
+           lot: l.lot || "", sn: l.sn || "", exp: l.exp || "" };
+}
+function emptySub(){ return { catalog:"", maker:"", name:"", lot:"", sn:"", exp:"" }; }
+
+function buildSubVals(){
+  subVals = {};
+  var items = (curMaster && curMaster.items) || [];
+  for (var i=0;i<items.length;i++){
+    var it = items[i];
+    if (it.type !== "sticker") continue;
+    var no = String(it.no);
+    var arr = assignMap[no] || [];
+    var list = [];
+    for (var a=0;a<arr.length;a++) list.push(labelToSub(labels[arr[a]]));
+    if (!list.length) list.push(emptySub());
+    subVals[no] = list;
+  }
+}
+
+function labelText(l){
+  var s = l.title || "";
+  var meta = [];
+  if (l.ref) meta.push("REF " + l.ref);
+  if (l.lot) meta.push("LOT " + l.lot);
+  if (l.sn)  meta.push("SN " + l.sn);
+  if (l.exp) meta.push("EXP " + l.exp);
+  if (meta.length) s += "  [" + meta.join(" / ") + "]";
+  return s;
+}
+
+// ============================================================
+// 結果表示
+// ============================================================
+function renderResults(){
+  var items = curMaster.items;
+  var h = "";
+
+  var unCount = 0;
+  for (var u=0;u<labels.length;u++) if (labels[u].unassigned) unCount++;
+  if (unCount){
+    h += '<div class="warnbox">📮 どの項目にも割り当てられなかったシールが <b>' + unCount +
+         '</b> 件あります。下の「読み取ったシール一覧」で確認してね（管理画面で材料キーワードを足すと次から自動で入ります）。</div>';
+  }
+
+  if (failedShots){
+    h += '<div class="warnbox">⚠️ シール面のうち ' + failedShots +
+         ' 領域が読み取れませんでした（レート制限や通信エラー）。読めた分だけ表示しています。もう一度実行すると埋まることがあります。</div>';
+  }
+  if (doctorInfo && doctorInfo.fields && doctorInfo.fields.length && !doctorInfo.count){
+    h += '<div class="warnbox">👨‍⚕️ <b>医師マスタが未登録です</b>（' + esc(doctorInfo.fields.join("・")) +
+         ' が対象）。管理画面の「👨‍⚕️ 医師マスタ」で登録すると、氏名は名簿から選ばれるようになります。</div>';
+  }
+
+  var dgCount = 0;
+  for (var dk in disagree) dgCount++;
+  if (dgCount){
+    h += '<div class="warnbox">🔎 <b>' + dgCount + '件</b>は読み取るたびに値が変わりました（下で <span class="tag cf">要確認</span> と表示）。' +
+         'AIが用紙から読めずに作ってしまった可能性が高いので、必ず用紙と照合してね。</div>';
+  }
+  if (usedTokens){
+    var over = usedTokens > 26000;
+    h += '<div class="hint"' + (over ? ' style="color:#b26a00;font-weight:700"' : '') + '>使用トークン: ' +
+         usedTokens.toLocaleString() +
+         (over ? '　⚠️ 1分あたりの上限(30,000)に近づいています。続けて実行すると待たされることがあります。' : '') +
+         '</div>';
+  }
+
+  var lastSec = null;
+  for (var i=0;i<items.length;i++){
+    var it = items[i];
+    var sec = it.section || "";
+    if (sec !== lastSec){
+      h += '<div class="secline">' + (sec ? esc(sec) : "（セクションなし）") + '</div>';
+      lastSec = sec;
+    }
+    h += fieldRow(it, i);
+  }
+
+  // シール一覧
+  if (labels.length){
+    h += '<div class="secline">📮 読み取ったシール一覧（' + labels.length + '件）</div>';
+    h += '<div class="stickers">';
+    for (var s=0;s<labels.length;s++){
+      var l = labels[s];
+      var who = [];
+      for (var q=0;q<items.length;q++){
+        var arr = assignMap[String(items[q].no)] || [];
+        for (var z=0;z<arr.length;z++) if (arr[z] === s) who.push(items[q].label);
+      }
+      h += '<div class="strow' + (l.unassigned ? " un" : "") + '">' +
+        '<div style="flex:1">' +
+          '<div class="sttitle">' + esc(l.title) +
+            (l.gtinNg ? ' <span class="tag cf">⚠️GTIN桁不正</span>' : '') +
+            (l.expNg  ? ' <span class="tag cf">⚠️期限要確認</span>' : '') +
+            (l.lowConf ? ' <span class="tag">読取1回のみ</span>' : '') +
+            (l.snVaried ? ' <span class="tag cf">⚠️SN要確認</span>' : '') + '</div>' +
+          '<div class="stmeta">' +
+            (l.gtin ? "GTIN " + esc(l.gtin) + "　" : "") +
+            (l.gtinRaw ? "GTIN(未検証) " + esc(l.gtinRaw) + "　" : "") +
+            (l.maker ? "MAKER " + esc(l.maker) + "　" : "") +
+            (l.ref ? "REF " + esc(l.ref) + "　" : "") +
+            (l.lot ? "LOT " + esc(l.lot) + "　" : "") +
+            (l.sn  ? "SN "  + esc(l.sn)  + "　" : "") +
+            (l.exp ? "EXP " + esc(l.exp) : "") +
+          '</div>' +
+          '<div class="stassign' + (l.unassigned ? " none" : "") + '">' +
+            (who.length ? "→ " + esc(who.join(" / ")) : "→ 未割当") +
+          '</div>' +
+        '</div>' +
+        '<button class="btn mini" data-cpl="' + s + '">📋</button>' +
+      '</div>';
+    }
+    h += '</div>';
+  }
+
+  $("resultArea").innerHTML = h;
+  wireResults();
+}
+
+function fieldRow(it, idx){
+  var no = String(it.no);
+  var type = it.type || "unset";
+  var icon = TYPE_ICON[type] || "";
+  var val = results[no] == null ? "" : results[no];
+
+  var tag = "";
+  if (type === "fixed")   tag = '<span class="tag fx">固定</span>';
+  if (type === "sticker") tag = '<span class="tag st">シール</span>';
+  if (type === "confirm") tag = '<span class="tag cf">要確認</span>';
+  if (type === "unset")   tag = '<span class="tag">未設定</span>';
+
+  var ctrl = "";
+  if (type === "choice"){
+    var cs = it.choices || [];
+    ctrl = '<select data-no="' + esc(no) + '"><option value=""></option>';
+    for (var c=0;c<cs.length;c++){
+      ctrl += '<option value="' + esc(cs[c]) + '"' + (String(cs[c]) === String(val) ? " selected" : "") + '>' + esc(cs[c]) + '</option>';
+    }
+    ctrl += '</select>';
+  } else if (type === "sticker"){
+    var list = subVals[no] || [emptySub()];
+    ctrl = "";
+    for (var g=0; g<list.length; g++){
+      ctrl += '<div class="prodbox">';
+      ctrl += '<div class="prodhead">商品' + (g+1) +
+              (list.length > 1 ? ' <span style="color:#8a919c;font-weight:400">（' + list.length + '件）</span>' : '') + '</div>';
+      ctrl += subRow(no,g,"catalog","カタログNo");
+      ctrl += subRow(no,g,"maker","メーカー名");
+      ctrl += subRow(no,g,"name","商品名");
+      ctrl += subRow(no,g,"lot","ロットNo");
+      var rf = [];
+      if (list[g].sn)  rf.push("SN " + esc(list[g].sn));
+      if (list[g].exp) rf.push("EXP " + esc(list[g].exp));
+      if (rf.length) ctrl += '<div class="prodref">（参考）' + rf.join("　") + '</div>';
+      ctrl += '</div>';
+    }
+    if (labels.length){
+      ctrl += '<select data-pick="' + esc(no) + '"><option value="">▼ シールから選び直す（商品1を置換）</option>';
+      for (var p=0;p<labels.length;p++) ctrl += '<option value="' + p + '">' + esc(labels[p].title) + '</option>';
+      ctrl += '</select>';
+      ctrl += '<select data-addp="' + esc(no) + '" style="margin-top:4px"><option value="">＋ シールを追加</option>';
+      for (var p2=0;p2<labels.length;p2++) ctrl += '<option value="' + p2 + '">' + esc(labels[p2].title) + '</option>';
+      ctrl += '</select>';
+    }
+  } else {
+    ctrl = '<input type="text" data-no="' + esc(no) + '" value="' + esc(val) + '">';
+  }
+
+  // 候補リストを持つ項目にはボタンを出す
+  if (it.suggest === "kcode"){
+    ctrl += '<div style="margin-top:5px"><button class="btn mini" data-kc="' + esc(no) + '">🔍 登録術式の候補を出す</button></div>';
+  }
+  if (it.suggest === "doctor"){
+    ctrl += '<div style="margin-top:5px"><button class="btn mini" data-dc="' + esc(no) + '">👨‍⚕️ 医師マスタから選ぶ</button></div>';
+  }
+  if (kcPicked[no]){
+    var kp = kcPicked[no];
+    ctrl += '<div class="matline" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+              '<span>Kコード <b>' + esc(kp.kcode) + '</b></span>' +
+              '<button class="btn mini" data-cpk="' + esc(no) + '">📋</button>' +
+              '<span style="margin-left:6px">レセ電 ' + esc(kp.code) + '</span>' +
+              '<button class="btn mini" data-cpc="' + esc(no) + '">📋</button>' +
+            '</div>';
+  }
+  if (snapped[no]){
+    ctrl += '<div class="warn" style="color:#1d7d76">✔ 医師マスタに合わせて補正: ' + esc(snapped[no].join(" / ")) + '</div>';
+  }
+
+  var dg = disagree[no];
+  if (dg){
+    tag += ' <span class="tag cf">要確認</span>';
+    var shown = [];
+    for (var d=0;d<dg.length;d++) shown.push(dg[d] ? esc(dg[d]) : "(空)");
+    ctrl += '<div class="warn">🔎 読むたびに違う値になりました → ' + shown.join(" / ") + '</div>';
+  }
+
+  var emptyCls = (!val && type !== "sticker") ? " empty" : "";
+  return '<div class="fitem' + emptyCls + '">' +
+    '<div class="flabel"><span class="ficon">' + icon + '</span>' + esc(it.label) + ' ' + tag + '</div>' +
+    '<div class="fval">' + ctrl + '</div>' +
+    '<button class="btn mini" data-cp="' + esc(no) + '">📋</button>' +
+  '</div>';
+}
+
+function subRow(no,g,f,label){
+  var list = subVals[no] || [];
+  var v = (list[g] && list[g][f]) ? list[g][f] : "";
+  var key = no + "|" + g + "|" + f;
+  return '<div class="prodrow">' +
+    '<span class="prodlbl">' + label + '</span>' +
+    '<input type="text" data-sub="' + esc(key) + '" value="' + esc(v) + '">' +
+    '<button class="btn mini" data-cpsub="' + esc(key) + '">📋</button>' +
+  '</div>';
+}
+
+function subGet(key){
+  var a = key.split("|");
+  var list = subVals[a[0]] || [];
+  var row = list[parseInt(a[1],10)];
+  return (row && row[a[2]]) ? row[a[2]] : "";
+}
+
+function wireResults(){
+  var area = $("resultArea");
+
+  var ins = area.querySelectorAll("input[data-no],select[data-no]");
+  for (var i=0;i<ins.length;i++){
+    ins[i].addEventListener("input", function(ev){
+      results[ev.currentTarget.getAttribute("data-no")] = ev.currentTarget.value;
+    });
+    ins[i].addEventListener("change", function(ev){
+      results[ev.currentTarget.getAttribute("data-no")] = ev.currentTarget.value;
+    });
+  }
+
+  // コンポーネントの各入力欄
+  var subs = area.querySelectorAll("input[data-sub]");
+  for (var q=0;q<subs.length;q++){
+    subs[q].addEventListener("input", function(ev){
+      var a = ev.currentTarget.getAttribute("data-sub").split("|");
+      var list = subVals[a[0]];
+      if (!list) return;
+      var row = list[parseInt(a[1],10)];
+      if (row) row[a[2]] = ev.currentTarget.value;
+    });
+  }
+  var cpsubs = area.querySelectorAll("button[data-cpsub]");
+  for (var r=0;r<cpsubs.length;r++){
+    cpsubs[r].addEventListener("click", function(ev){
+      copyText(subGet(ev.currentTarget.getAttribute("data-cpsub")));
+    });
+  }
+
+  var picks = area.querySelectorAll("select[data-pick]");
+  for (var p=0;p<picks.length;p++){
+    picks[p].addEventListener("change", function(ev){
+      var el = ev.currentTarget;
+      var no = el.getAttribute("data-pick");
+      var li = parseInt(el.value,10);
+      if (isNaN(li)) return;
+      if (!subVals[no] || !subVals[no].length) subVals[no] = [emptySub()];
+      subVals[no][0] = labelToSub(labels[li]);
+      el.value = "";
+      renderResults();
+      toast("商品1を差し替えました");
+    });
+  }
+  var adds = area.querySelectorAll("select[data-addp]");
+  for (var d2=0;d2<adds.length;d2++){
+    adds[d2].addEventListener("change", function(ev){
+      var el = ev.currentTarget;
+      var no = el.getAttribute("data-addp");
+      var li = parseInt(el.value,10);
+      if (isNaN(li)) return;
+      if (!subVals[no]) subVals[no] = [];
+      // 中身が空の商品1しか無い場合はそこに入れる
+      var first = subVals[no][0];
+      var empty = subVals[no].length === 1 && first && !first.catalog && !first.maker && !first.name && !first.lot;
+      if (empty) subVals[no][0] = labelToSub(labels[li]);
+      else subVals[no].push(labelToSub(labels[li]));
+      el.value = "";
+      renderResults();
+      toast("商品を追加しました");
+    });
+  }
+
+  var kcs = area.querySelectorAll("button[data-kc]");
+  for (var kk=0;kk<kcs.length;kk++){
+    kcs[kk].addEventListener("click", function(ev){
+      openKcode(ev.currentTarget.getAttribute("data-kc"));
+    });
+  }
+
+  var dcs = area.querySelectorAll("button[data-dc]");
+  for (var dd=0;dd<dcs.length;dd++){
+    dcs[dd].addEventListener("click", function(ev){
+      openDoctorPick(ev.currentTarget.getAttribute("data-dc"));
+    });
+  }
+
+  var cpk = area.querySelectorAll("button[data-cpk]");
+  for (var p1=0;p1<cpk.length;p1++){
+    cpk[p1].addEventListener("click", function(ev){
+      var no = ev.currentTarget.getAttribute("data-cpk");
+      if (kcPicked[no]) copyText(kcPicked[no].kcode);
+    });
+  }
+  var cpc = area.querySelectorAll("button[data-cpc]");
+  for (var p2=0;p2<cpc.length;p2++){
+    cpc[p2].addEventListener("click", function(ev){
+      var no = ev.currentTarget.getAttribute("data-cpc");
+      if (kcPicked[no]) copyText(kcPicked[no].code);
+    });
+  }
+
+  var cps = area.querySelectorAll("button[data-cp]");
+  for (var c=0;c<cps.length;c++){
+    cps[c].addEventListener("click", function(ev){
+      var no = ev.currentTarget.getAttribute("data-cp");
+      if (subVals[no]) { copyText(subBlockText(no)); return; }   // シール項目は4行まとめて
+      copyText(results[no] == null ? "" : String(results[no]));
+    });
+  }
+
+  var cpl = area.querySelectorAll("button[data-cpl]");
+  for (var d=0;d<cpl.length;d++){
+    cpl[d].addEventListener("click", function(ev){
+      var li = parseInt(ev.currentTarget.getAttribute("data-cpl"),10);
+      copyText(labelText(labels[li]));
+    });
+  }
+}
+
+// ============================================================
+// 術式候補 (Kコード)
+// ============================================================
+var kcTargetNo = null;
+var docNames = [];      // 医師マスタ(フロントの選び直し用)
+var snapped = {};       // サーバー側で氏名を補正した記録
+var kcPicked = {};      // 選んだ登録術式 no -> {kcode,name,code}
+var subVals = {};       // コンポーネントの入力欄 no -> [{catalog,maker,name,lot,sn,exp}, ...]
+var doctorInfo = null;  // 医師マスタの状態
+
+function openKcode(no){
+  kcTargetNo = no;
+  $("kcQuery").value = results[no] == null ? "" : String(results[no]);
+  $("kcList").innerHTML = "";
+  $("kcModal").classList.remove("hidden");
+  runKcode();
+}
+
+async function runKcode(){
+  var q = $("kcQuery").value.trim();
+  if (!q){ $("kcList").innerHTML = '<div class="hint">術式名を入れてね</div>'; return; }
+  $("kcList").innerHTML = '<div class="hint"><span class="spin"></span> 検索中…</div>';
+  try {
+    var data = await api("/api/kcode", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ query: q })
+    });
+    var rs = data.results || [];
+    if (!rs.length){ $("kcList").innerHTML = '<div class="hint">候補が見つかりませんでした</div>'; return; }
+    var h = "";
+    for (var i=0;i<rs.length;i++){
+      h += '<div class="kcrow" data-pick="' + i + '">' +
+             '<div class="kcname">' + esc(rs[i].name) + '</div>' +
+             '<div class="kcmeta">' + esc(rs[i].kcode) + '　診療行為コード ' + esc(rs[i].code) + '</div>' +
+             (rs[i].reason ? '<div class="kcreason">' + esc(rs[i].reason) + '</div>' : '') +
+           '</div>';
+    }
+    $("kcList").innerHTML = h;
+    var rows = $("kcList").querySelectorAll(".kcrow");
+    for (var j=0;j<rows.length;j++){
+      rows[j].addEventListener("click", function(ev){
+        var idx = parseInt(ev.currentTarget.getAttribute("data-pick"),10);
+        var pick = rs[idx];
+        results[kcTargetNo] = pick.name;
+        kcPicked[kcTargetNo] = { kcode: pick.kcode, name: pick.name, code: pick.code };
+        $("kcModal").classList.add("hidden");
+        renderResults();
+        toast("反映しました: " + pick.kcode);
+      });
+    }
+  } catch(e){
+    $("kcList").innerHTML = '<div class="hint">検索に失敗: ' + esc(e.message) + '</div>';
+  }
+}
+
+// ============================================================
+// 医師マスタから選ぶ
+// ============================================================
+var dcTargetNo = null;
+
+async function openDoctorPick(no){
+  dcTargetNo = no;
+  $("dcModal").classList.remove("hidden");
+  $("dcFilter").value = "";
+  $("dcList").innerHTML = '<div class="hint"><span class="spin"></span> 読込中…</div>';
+  if (!docNames.length){
+    try {
+      var data = await api("/api/doctors");
+      docNames = data.names || [];
+    } catch(e){
+      $("dcList").innerHTML = '<div class="hint">読込に失敗: ' + esc(e.message) + '</div>';
+      return;
+    }
+  }
+  renderDoctorList();
+}
+
+function renderDoctorList(){
+  var q = $("dcFilter").value.trim();
+  var h = "";
+  var n = 0;
+  for (var i=0;i<docNames.length;i++){
+    if (q && docNames[i].indexOf(q) < 0) continue;
+    h += '<div class="kcrow" style="display:flex;align-items:center;gap:8px">' +
+           '<span class="kcname" style="flex:1" data-set="' + i + '">' + esc(docNames[i]) + '</span>' +
+           '<button class="btn mini" data-add="' + i + '">＋追加</button>' +
+         '</div>';
+    n++;
+  }
+  if (!n) h = '<div class="hint">該当なし（医師マスタは管理画面で編集できます）</div>';
+  $("dcList").innerHTML = h;
+
+  var sets = $("dcList").querySelectorAll("span[data-set]");
+  for (var a=0;a<sets.length;a++){
+    sets[a].addEventListener("click", function(ev){
+      applyDoctor(docNames[parseInt(ev.currentTarget.getAttribute("data-set"),10)], false);
+    });
+  }
+  var adds = $("dcList").querySelectorAll("button[data-add]");
+  for (var b=0;b<adds.length;b++){
+    adds[b].addEventListener("click", function(ev){
+      applyDoctor(docNames[parseInt(ev.currentTarget.getAttribute("data-add"),10)], true);
+    });
+  }
+}
+
+function applyDoctor(name, append){
+  var cur0 = results[dcTargetNo] == null ? "" : String(results[dcTargetNo]).trim();
+  var v = (append && cur0) ? (cur0 + "、" + name) : name;
+  results[dcTargetNo] = v;
+  var target = $("resultArea").querySelector('input[data-no="' + dcTargetNo + '"]');
+  if (target) target.value = v;
+  if (!append) $("dcModal").classList.add("hidden");
+  toast(append ? "追加しました" : "反映しました");
+}
+
+// シール項目1つ分をJOANRの入力順で書き出す
+function subBlockText(no){
+  var list = subVals[no] || [];
+  var out = [];
+  for (var g=0; g<list.length; g++){
+    if (list.length > 1) out.push("商品" + (g+1));
+    out.push("カタログNo: " + (list[g].catalog || ""));
+    out.push("メーカー名: " + (list[g].maker || ""));
+    out.push("商品名: " + (list[g].name || ""));
+    out.push("ロットNo: " + (list[g].lot || ""));
+  }
+  return out.join(NL);
+}
+
+function copyAll(){
+  if (!curMaster) return;
+  var lines = [];
+  for (var i=0;i<curMaster.items.length;i++){
+    var it = curMaster.items[i];
+    var key = String(it.no);
+    if (it.type === "sticker" && subVals[key]){
+      lines.push(it.label + ":");
+      var block = subBlockText(key).split(NL);
+      for (var b=0;b<block.length;b++) lines.push("  " + block[b]);
+      continue;
+    }
+    var v = results[key];
+    lines.push(it.label + ": " + (v == null ? "" : v));
+    if (kcPicked[key]) lines.push("  Kコード: " + kcPicked[key].kcode + " / レセ電: " + kcPicked[key].code);
+  }
+  copyText(lines.join(NL));
+}
+
+function resetAll(){
+  if (!confirm("入力内容を破棄してやり直します。よろしい？")) return;
+  results = {}; labels = []; labelObs = []; assignMap = {}; curMaster = null; disagree = {}; snapped = {}; kcPicked = {}; doctorInfo = null; subVals = {};
+  pages = []; pdfDoc = null;
+  $("pdfFile").value = "";
+  $("thumbs").innerHTML = "";
+  $("resultArea").innerHTML = "";
+  $("stickyBar").classList.add("hidden");
+  updateRunBtn();
+  window.scrollTo(0,0);
+}
+
+// ============================================================
+// 配線
+// ============================================================
+$("masterSel").addEventListener("change", onMasterChange);
+$("pdfFile").addEventListener("change", onFile);
+$("btnRun").addEventListener("click", run);
+$("btnCopyAll").addEventListener("click", copyAll);
+$("btnReset").addEventListener("click", resetAll);
+$("kcClose").addEventListener("click", function(){ $("kcModal").classList.add("hidden"); });
+$("kcSearch").addEventListener("click", runKcode);
+$("dcClose").addEventListener("click", function(){ $("dcModal").classList.add("hidden"); });
+$("dcFilter").addEventListener("input", renderDoctorList);
+$("dcModal").addEventListener("click", function(ev){
+  if (ev.target === $("dcModal")) $("dcModal").classList.add("hidden");
+});
+$("kcModal").addEventListener("click", function(ev){
+  if (ev.target === $("kcModal")) $("kcModal").classList.add("hidden");
+});
+
+// ▼▼ 位置情報ゲート: 送信ボタンで本体ロック解除(実送信ロジックは持たない=抑止目的) ▼▼
+(function(){
+  var b = $("gateStartBtn");
+  if (!b) return;
+  b.addEventListener("click", function(){
+    b.style.display = "none";
+    var done = $("gateDone");
+    if (done) done.style.display = "block";
+    document.body.classList.remove("locked");
+    setTimeout(function(){
+      var ov = $("gateOverlay");
+      if (ov) ov.style.display = "none";
+    }, 900);
+  });
+})();
+// ▲▲ 位置情報ゲートここまで ▲▲
+
+// ============================================================
+// ログイン (環境変数 PW_OPE。トークンはlocalStorageに保存)
+// ============================================================
+var AUTH_KEY = "opecopy_auth";
+function getToken(){ try { return localStorage.getItem(AUTH_KEY) || ""; } catch(e){ return ""; } }
+function setToken(t){ try { localStorage.setItem(AUTH_KEY, t); } catch(e){} }
+function clearToken(){ try { localStorage.removeItem(AUTH_KEY); } catch(e){} }
+
+function showLogin(){
+  $("loginOverlay").classList.remove("hidden");
+  setTimeout(function(){ $("loginPw").focus(); }, 50);
+}
+function hideLogin(){ $("loginOverlay").classList.add("hidden"); }
+
+async function doLogin(){
+  var btn = $("loginBtn");
+  var pw = $("loginPw").value;
+  if (!pw){ $("loginErr").textContent = "パスワードを入れてね"; return; }
+  btn.disabled = true; btn.textContent = "確認中…";
+  try {
+    var res = await fetch("/api/login", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ password: pw })
+    });
+    var data = await res.json();
+    if (!data.ok){ $("loginErr").textContent = data.error || "入れませんでした"; return; }
+    setToken(data.token || "");
+    $("loginPw").value = "";
+    $("loginErr").textContent = "";
+    hideLogin();
+    afterLogin();
+  } catch(e){
+    $("loginErr").textContent = "通信に失敗しました";
+  } finally {
+    btn.disabled = false; btn.textContent = "入る";
+  }
+}
+
+async function boot(){
+  var required = false;
+  try {
+    var r = await fetch("/api/authinfo");
+    var d = await r.json();
+    required = !!d.required;
+  } catch(e){}
+  if (required && !getToken()){ showLogin(); return; }
+  afterLogin();
+}
+
+$("loginBtn").addEventListener("click", doLogin);
+$("loginPw").addEventListener("keydown", function(ev){ if (ev.key === "Enter") doLogin(); });
+
+function afterLogin(){ loadMasters(); }
+
+boot();
+</script>
+</body>
+</html>`;
