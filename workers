@@ -50,6 +50,8 @@
 
 const KV_PREFIX = "master:";
 const DOCTORS_KEY = "staff:doctors";
+const USERS_KEY = "auth:users";   // BASIC認証の利用者名簿(KV)
+const KCODE_KEY = "kcode:list";   // 術式マスタ(Kコード)。KVが空ならコード内の初期値を使う
 
 // ▼▼ 認証を外したいAPIがあればここに書く ▼▼
 //   既定は空 = すべてのAPIがパスワード保護される。
@@ -64,7 +66,7 @@ const AUTH_FREE_PATHS = [];
 //     画面に出す6桁の数字は「PCとスマホで同じ番号か目視で確かめる」ためのもの。
 //     QRのURLに入る実際の鍵は、別に発行する長いランダム文字列。
 //     6桁だけを鍵にすると総当たりで当てられてしまうため、この2階建てにしている。
-const QR_ENABLED        = true;  // false にすると機能ごと無効（従来どおり動く）
+const QR_ENABLED        = false; // BASIC認証に一本化したため無効（コードは残置）
 const QR_TTL_SEC        = 180;   // QRの有効期限(秒)。切れたら再表示ボタンで発行し直す
 const QR_SESSION_HOURS  = 12;    // 認証後、PCが読み取りを行える時間
 const QR_SLOT_SEC       = 5;     // 何秒ごとに別のキーを見に行くか（KVのキャッシュ対策）
@@ -80,7 +82,26 @@ export default {
     const path = url.pathname;
     const method = request.method;
 
+    let authUser = "";
     try {
+      // ---------- 外周ゲート ----------
+      // ① 許可IP以外は入口で遮断（ログイン画面すら見せない）
+      if (!ipAllowed(request, env)) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      // ② BASIC認証。名簿(KV)か、非常口(MASTER_ID/MASTER_PW)で照合する
+      const gate = await basicGate(request, env);
+      if (!gate.ok) {
+        return new Response("Authorization Required", {
+          status: 401,
+          headers: {
+            "WWW-Authenticate": 'Basic realm="opecopy", charset="UTF-8"',
+            "content-type": "text/plain; charset=utf-8",
+          },
+        });
+      }
+      authUser = gate.user;
+
       // ---------- 画面 ----------
       if (method === "GET" && (path === "/" || path === "")) {
         return new Response(FRONT_HTML, {
@@ -111,12 +132,12 @@ export default {
       if (method === "POST" && path === "/api/qr/approve") {
         return await apiQrApprove(env, await request.json());
       }
-      if (path.startsWith("/api/") && AUTH_FREE_PATHS.indexOf(path) < 0 &&
-          !(await checkAuth(request, env))) {
+      // 外周はBASICが守るので、PW_OPEは管理系APIだけに効かせる
+      if (isAdminApi(method, path) && !(await checkAuth(request, env))) {
         return jsonError("認証が必要です", 401);
       }
       // 患者画像を外部AIに送る操作は、スマホ承認済みであることを追加で確認する
-      if (QR_PROTECTED_PATHS.indexOf(path) >= 0 && !(await checkQrSession(request, env))) {
+      if (QR_ENABLED && QR_PROTECTED_PATHS.indexOf(path) >= 0 && !(await checkQrSession(request, env))) {
         return jsonError("スマホでのQR認証が必要です。画面を再読み込みして認証し直してください。", 401);
       }
       if (method === "POST" && path === "/api/qr/new") {
@@ -164,7 +185,7 @@ export default {
         return await apiSaveDoctors(env, await request.json());
       }
       if (method === "POST" && path === "/api/record") {
-        return await saveRecord(env, await request.json());
+        return await saveRecord(env, await request.json(), authUser);
       }
       if (method === "GET" && path === "/api/record") {
         return await getRecord(env, url.searchParams.get("id"));
@@ -174,6 +195,21 @@ export default {
       }
       if (method === "GET" && path === "/api/records") {
         return await listRecords(env, url.searchParams);
+      }
+      if (method === "GET" && path === "/api/kcodes") {
+        return await apiGetKcodes(env);
+      }
+      if (method === "POST" && path === "/api/kcodes") {
+        return await apiSaveKcodes(env, await request.json());
+      }
+      if (method === "GET" && path === "/api/users") {
+        return await apiListUsers(env);
+      }
+      if (method === "POST" && path === "/api/users") {
+        return await apiSaveUser(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/users/delete") {
+        return await apiDeleteUser(env, await request.json());
       }
 
       return new Response("Not Found", { status: 404 });
@@ -306,13 +342,13 @@ async function deleteMaster(env, body) {
 // ============================================================
 function recNowIso() { return new Date().toISOString(); }
 
-async function saveRecord(env, body) {
+async function saveRecord(env, body, authUser) {
   if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
   const b = body || {};
   const id = b.id ? Number(b.id) : 0;
   const now = recNowIso();
   const payload = typeof b.payload === "string" ? b.payload : JSON.stringify(b.payload || {});
-  const by = String(b.by || "");   // ← BASIC認証を入れたら request のユーザー名で上書きする
+  const by = String(authUser || b.by || "");   // BASIC認証のユーザー名を優先する
   const mId = b.master_id || null;
   const mName = b.master_name || null;
   const pNo = b.patient_no || null;
@@ -387,6 +423,180 @@ async function deleteRecord(env, body) {
 // 医師マスタ (氏名リスト)
 //   ハードコードせず KV に持つ。管理画面で編集・Excel取込ができる。
 // ============================================================
+// ============================================================
+// 外周ゲート（IP制限 + BASIC認証）
+//   ・ALLOW_IPS  … 許可する送信元グローバルIP。カンマ区切り。CIDR可。未設定なら制限しない
+//   ・MASTER_ID / MASTER_PW … 名簿が壊れても入れる非常口。画面には一切出さない
+//   ・利用者名簿はKV(USERS_KEY)。パスワードは平文で持たずSHA-256で保存する
+//   ※どちらも未設定なら素通しにする（自分でロックアウトしないため）
+// ============================================================
+function clientIp(request) {
+  return String(request.headers.get("CF-Connecting-IP") || "").trim();
+}
+
+// IPv4を数値へ。IPv6や不正値は null
+function ipv4ToInt(ip) {
+  const m = String(ip).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) return null;
+  let v = 0;
+  for (let i = 1; i <= 4; i++) {
+    const n = Number(m[i]);
+    if (n < 0 || n > 255) return null;
+    v = v * 256 + n;
+  }
+  return v;
+}
+
+function ipMatches(ip, rule) {
+  const r = String(rule).trim();
+  if (!r) return false;
+  if (r === ip) return true;               // 完全一致（IPv6もここで通る）
+  const slash = r.indexOf("/");
+  if (slash < 0) return false;
+  const base = ipv4ToInt(r.slice(0, slash));
+  const bits = Number(r.slice(slash + 1));
+  const target = ipv4ToInt(ip);
+  if (base === null || target === null) return false;
+  if (!(bits >= 0 && bits <= 32)) return false;
+  if (bits === 0) return true;
+  const mask = bits === 32 ? 0xFFFFFFFF : ~((1 << (32 - bits)) - 1) >>> 0;
+  return ((base & mask) >>> 0) === ((target & mask) >>> 0);
+}
+
+function ipAllowed(request, env) {
+  const raw = String((env && env.ALLOW_IPS) || "").trim();
+  if (!raw) return true;                   // 未設定なら制限しない
+  const ip = clientIp(request);
+  if (!ip) return false;
+  const rules = raw.split(/[,\s]+/);
+  for (const r of rules) {
+    if (ipMatches(ip, r)) return true;
+  }
+  return false;
+}
+
+// 名簿を読む。形は { users: [ { id, name, hash, createdAt } ] }
+async function loadUsers(env) {
+  if (!env.FORM_KV) return [];
+  try {
+    const raw = await env.FORM_KV.get(USERS_KEY);
+    if (!raw) return [];
+    const obj = JSON.parse(raw);
+    return Array.isArray(obj.users) ? obj.users : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+async function storeUsers(env, users) {
+  await env.FORM_KV.put(USERS_KEY, JSON.stringify({ users: users }));
+}
+
+// パスワードはIDを混ぜてハッシュ化する（同じパスワードでも別の値になる）
+async function userHash(id, pw) {
+  return await sha256Hex("opecopy:user:v1:" + String(id) + ":" + String(pw));
+}
+
+function decodeBasic(request) {
+  const h = String(request.headers.get("Authorization") || "");
+  if (h.slice(0, 6).toLowerCase() !== "basic ") return null;
+  let txt = "";
+  try {
+    const bin = atob(h.slice(6).trim());
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    txt = new TextDecoder("utf-8").decode(bytes);   // 日本語IDでも壊れないように
+  } catch (e) {
+    return null;
+  }
+  const p = txt.indexOf(":");
+  if (p < 0) return null;
+  return { id: txt.slice(0, p), pw: txt.slice(p + 1) };
+}
+
+async function basicGate(request, env) {
+  const users = await loadUsers(env);
+  const hasMaster = !!(env && env.MASTER_ID && env.MASTER_PW);
+  // 名簿も非常口も無い＝まだ設定前。締め出さないよう素通しにする
+  if (!users.length && !hasMaster) return { ok: true, user: "" };
+
+  const cred = decodeBasic(request);
+  if (!cred || !cred.id) return { ok: false, user: "" };
+
+  if (hasMaster && cred.id === String(env.MASTER_ID) && cred.pw === String(env.MASTER_PW)) {
+    return { ok: true, user: cred.id };
+  }
+  for (const u of users) {
+    if (u && u.id === cred.id) {
+      const h = await userHash(cred.id, cred.pw);
+      if (h === u.hash) return { ok: true, user: cred.id };
+      return { ok: false, user: "" };
+    }
+  }
+  return { ok: false, user: "" };
+}
+
+// PW_OPE を必要とする管理系API（表側の画面が使うAPIは対象外）
+function isAdminApi(method, path) {
+  if (path === "/api/users" || path === "/api/users/delete") return true;
+  if (path === "/api/kcodes") return true;
+  if (path === "/api/records") return true;
+  if (path === "/api/record/delete") return true;
+  if (path === "/api/record" && method === "GET") return true;
+  if (path === "/api/master" && method === "POST") return true;
+  if (path === "/api/master/delete") return true;
+  if (path === "/api/doctors" && method === "POST") return true;
+  return false;
+}
+
+// ---- 利用者管理API（パスワードのハッシュも非常口の情報も返さない）----
+async function apiListUsers(env) {
+  if (!env.FORM_KV) return jsonError("KVバインディング FORM_KV が設定されていません", 500);
+  const users = await loadUsers(env);
+  const list = users.map((u) => ({ id: u.id, name: u.name || "", createdAt: u.createdAt || "" }));
+  return jsonOk({ users: list });
+}
+
+async function apiSaveUser(env, body) {
+  if (!env.FORM_KV) return jsonError("KVバインディング FORM_KV が設定されていません", 500);
+  const b = body || {};
+  const id = String(b.id || "").trim();
+  const pw = String(b.password || "");
+  const name = String(b.name || "").trim();
+  if (!id) return jsonError("IDを入力してください", 400);
+  if (!/^[A-Za-z0-9._-]{2,32}$/.test(id)) {
+    return jsonError("IDは半角英数字と . _ - のみ、2〜32文字にしてください", 400);
+  }
+  if (env.MASTER_ID && id === String(env.MASTER_ID)) {
+    return jsonError("このIDは使用できません", 400);
+  }
+  const users = await loadUsers(env);
+  let target = null;
+  for (const u of users) if (u.id === id) target = u;
+
+  if (target) {
+    if (pw) target.hash = await userHash(id, pw);   // 空なら現状のパスワードを保つ
+    target.name = name;
+  } else {
+    if (!pw) return jsonError("新規登録にはパスワードが必要です", 400);
+    if (pw.length < 4) return jsonError("パスワードは4文字以上にしてください", 400);
+    users.push({ id: id, name: name, hash: await userHash(id, pw), createdAt: new Date().toISOString() });
+  }
+  await storeUsers(env, users);
+  return jsonOk({ id: id, saved: true });
+}
+
+async function apiDeleteUser(env, body) {
+  if (!env.FORM_KV) return jsonError("KVバインディング FORM_KV が設定されていません", 500);
+  const id = String((body && body.id) || "").trim();
+  if (!id) return jsonError("idが不正です", 400);
+  const users = await loadUsers(env);
+  const left = users.filter((u) => u.id !== id);
+  if (left.length === users.length) return jsonError("その利用者は見つかりません", 404);
+  await storeUsers(env, left);
+  return jsonOk({ id: id, deleted: true });
+}
+
 // ============================================================
 // パスワード認証 (環境変数 PW_OPE)
 //   ・PW_OPE が未設定なら認証なし(自分でロックアウトしないため)
@@ -1864,8 +2074,70 @@ const KCODE_DATA = [
   ["K643", "後腹膜悪性腫瘍手術", "150162310"]
 ];
 
-const KCODE_BY_CODE = new Map();
-for (const r of KCODE_DATA) KCODE_BY_CODE.set(r[2], r);
+// 術式マスタを取り出す。KVに登録があればそれを使い、無ければ上の初期値を使う。
+//   → 取込に失敗しても業務が止まらないようにするための二段構え
+async function getKcodeData(env) {
+  if (env && env.FORM_KV) {
+    try {
+      const raw = await env.FORM_KV.get(KCODE_KEY, { cacheTtl: 300 });
+      if (raw) {
+        const obj = JSON.parse(raw);
+        const rows = Array.isArray(obj.rows) ? obj.rows : null;
+        if (rows && rows.length) return rows;
+      }
+    } catch (e) {
+      // 壊れていたら初期値に落とす
+    }
+  }
+  return KCODE_DATA;
+}
+
+function kcodeMap(rows) {
+  const m = new Map();
+  for (const r of rows) m.set(String(r[2]), r);
+  return m;
+}
+
+// Excelから来た行を整える。3列に満たない行・空行は捨て、レセ電コードの重複も除く
+function normalizeKcodeRows(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const r of rows || []) {
+    if (!Array.isArray(r)) continue;
+    const kcode = String(r[0] == null ? "" : r[0]).trim();
+    const name  = String(r[1] == null ? "" : r[1]).trim();
+    const code  = String(r[2] == null ? "" : r[2]).trim();
+    if (!kcode || !name || !code) continue;
+    if (seen.has(code)) continue;
+    seen.add(code);
+    out.push([kcode, name, code]);
+  }
+  return out;
+}
+
+async function apiGetKcodes(env) {
+  const rows = await getKcodeData(env);
+  let stored = false;
+  if (env && env.FORM_KV) {
+    try { stored = !!(await env.FORM_KV.get(KCODE_KEY)); } catch (e) {}
+  }
+  // stored=false なら「コード内の初期値を表示している」という意味
+  return jsonOk({ rows: rows, count: rows.length, stored: stored, builtinCount: KCODE_DATA.length });
+}
+
+async function apiSaveKcodes(env, body) {
+  if (!env.FORM_KV) return jsonError("KVバインディング FORM_KV が設定されていません", 500);
+  const b = body || {};
+  // reset:true なら登録を消してコード内の初期値に戻す
+  if (b.reset) {
+    await env.FORM_KV.delete(KCODE_KEY);
+    return jsonOk({ reset: true, count: KCODE_DATA.length });
+  }
+  const rows = normalizeKcodeRows(b.rows);
+  if (!rows.length) return jsonError("取り込める行がありません(3列すべて埋まった行が必要です)", 400);
+  await env.FORM_KV.put(KCODE_KEY, JSON.stringify({ rows: rows, updatedAt: new Date().toISOString() }));
+  return jsonOk({ saved: true, count: rows.length });
+}
 
 const KCODE_SCHEMA = {
   name: "kcode_match",
@@ -1897,7 +2169,9 @@ async function apiKcode(env, body) {
   if (query.length > 100) return jsonError("入力が長すぎます(100文字まで)", 400);
   if (!env.OPENAI_API_KEY) return jsonError("OPENAI_API_KEY が設定されていません", 500);
 
-  const listText = KCODE_DATA.map((r) => r[2] + "\t" + r[0] + "\t" + r[1]).join("\n");
+  const kcodeRows = await getKcodeData(env);
+  const byCode = kcodeMap(kcodeRows);
+  const listText = kcodeRows.map((r) => r[2] + "\t" + r[0] + "\t" + r[1]).join("\n");
 
   const systemPrompt =
     "あなたは整形外科の診療報酬請求に詳しい医療事務アシスタントです。" +
@@ -1923,7 +2197,7 @@ async function apiKcode(env, body) {
   const results = [];
   const raw = (out.json && out.json.results) || [];
   for (const r of raw) {
-    const row = KCODE_BY_CODE.get(String(r.code || "").trim());
+    const row = byCode.get(String(r.code || "").trim());
     if (!row) continue;                       // リスト外のコードは捨てる
     results.push({ kcode: row[0], name: row[1], code: row[2], reason: String(r.reason || "") });
     if (results.length >= 5) break;
@@ -2279,6 +2553,8 @@ const ADMIN_HTML = `<!DOCTYPE html>
       <button class="btn" id="btnExport">\uD83D\uDCE4 Excel書き出し</button>
       <button class="btn" id="btnDoc">\uD83D\uDC68‍⚕️ 医師マスタ</button>
       <button class="btn" id="btnRec">\uD83D\uDCD2 症例台帳</button>
+      <button class="btn" id="btnKc">\uD83E\uDE7A 術式マスタ</button>
+      <button class="btn" id="btnUsers">\uD83D\uDD11 利用者管理</button>
       <button class="btn" id="btnReload">\uD83D\uDD04 再読込</button>
     </div>
     <div id="listBody"><div class="empty"><span class="spin"></span> 読込中…</div></div>
@@ -2330,6 +2606,54 @@ const ADMIN_HTML = `<!DOCTYPE html>
     <div class="mfoot">
       <button class="btn" id="impCancel">キャンセル</button>
       <button class="btn primary" id="impRun" disabled>取込む</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 術式マスタ(Kコード) ============ -->
+<div class="overlay hidden" id="kcModal">
+  <div class="modal">
+    <div class="mhead">\uD83E\uDE7A 術式マスタ (Kコード)<small style="display:block;font-weight:400;color:#8a919c;font-size:12px;margin-top:3px">診療報酬改訂で内容が変わったら、Excelに書き出して直し、取り込み直してください</small></div>
+    <div class="mbody">
+      <div id="kcStat" class="empty">読込中…</div>
+      <div class="bar" style="margin-top:12px">
+        <input type="file" id="kcFile" accept=".xlsx,.xlsm,.xls,.csv" style="display:none">
+        <button class="btn" id="kcExport">\uD83D\uDCE4 Excel書き出し</button>
+        <button class="btn teal" id="kcImport">\uD83D\uDCE5 Excelから取込</button>
+        <button class="btn danger" id="kcReset">初期値に戻す</button>
+      </div>
+      <div class="hint" style="margin-top:10px">
+        列は左から <b>区分番号 / 名称 / レセ電コード</b> の3列です。見出し行は取込時に自動で読み飛ばします。<br>
+        取込は<b>全置換</b>です（今の内容は消えて、Excelの内容に入れ替わります）。3列すべて埋まっていない行と、レセ電コードが重複した行は取り込みません。
+      </div>
+      <div id="kcPreview" class="hidden" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px"></div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="kcClose">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 利用者管理 ============ -->
+<div class="overlay hidden" id="usrModal">
+  <div class="modal">
+    <div class="mhead">\uD83D\uDD11 利用者管理<small style="display:block;font-weight:400;color:#8a919c;font-size:12px;margin-top:3px">オペコピを開くときのBASIC認証のIDとパスワードです</small></div>
+    <div class="mbody">
+      <div class="hint" style="margin-bottom:10px">パスワードは暗号化して保存されるため、後から確認することはできません。忘れた場合はここで新しいものに変更してください。</div>
+      <div id="usrBody"><div class="empty">読込中…</div></div>
+      <div style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
+        <div style="font-weight:700;margin-bottom:8px">追加 / パスワード変更</div>
+        <div class="bar" style="flex-wrap:wrap;gap:6px">
+          <input type="text" id="usrId" placeholder="ID（半角英数字）" style="width:170px;padding:6px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px">
+          <input type="text" id="usrName" placeholder="表示名（任意）" style="width:170px;padding:6px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px">
+          <input type="password" id="usrPw" placeholder="パスワード" style="width:150px;padding:6px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px">
+          <button class="btn primary" id="usrAdd">登録</button>
+        </div>
+        <div class="hint" style="margin-top:6px">既にあるIDを指定すると、そのIDのパスワードを変更します。</div>
+      </div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="usrClose">閉じる</button>
     </div>
   </div>
 </div>
@@ -3417,6 +3741,222 @@ async function exportExcel(){
 // イベント配線
 // ============================================================
 // ============================================================
+// 術式マスタ (Kコード) — KV保存。Excelの往復で改訂に対応する
+// ============================================================
+var kcPending = null;   // 取込待ちの行
+
+async function openKcodes(){
+  $("kcModal").classList.remove("hidden");
+  $("kcPreview").classList.add("hidden");
+  kcPending = null;
+  await loadKcodes();
+}
+
+async function loadKcodes(){
+  $("kcStat").innerHTML = "読込中…";
+  try {
+    var r = await api("/api/kcodes");
+    kcRows = r.rows || [];
+    var src = r.stored
+      ? "Excelから取り込んだ内容を使用中"
+      : "コードに内蔵された初期値を使用中（まだ取込をしていません）";
+    $("kcStat").innerHTML = '<b>' + kcRows.length + ' 件</b> の術式を登録しています<br>' +
+      '<span style="color:#8a919c;font-size:12.5px">' + esc(src) + '</span>';
+  } catch(e){
+    $("kcStat").innerHTML = '読み込みに失敗しました: ' + esc(e.message);
+  }
+}
+
+var kcRows = [];
+
+async function exportKcodes(){
+  try {
+    await ensureXLSX();
+    if (!kcRows.length){ alert("書き出す術式がありません"); return; }
+    var aoa = [["区分番号","名称","レセ電コード"]];
+    for (var i=0;i<kcRows.length;i++){
+      aoa.push([kcRows[i][0], kcRows[i][1], kcRows[i][2]]);
+    }
+    var wb = window.XLSX.utils.book_new();
+    var ws = window.XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{wch:12},{wch:62},{wch:16}];
+    window.XLSX.utils.book_append_sheet(wb, ws, "術式マスタ");
+    window.XLSX.writeFile(wb, "オペコピ_術式マスタ.xlsx");
+    toast("書き出しました");
+  } catch(e){
+    alert("書き出しに失敗: " + e.message);
+  }
+}
+
+// 見出し行かどうかを判定する（3列目が数字でなければ見出しとみなす）
+function kcIsHeader(row){
+  var c = String(row[2] == null ? "" : row[2]).trim();
+  if (!c) return true;
+  return !/^[0-9]+$/.test(c);
+}
+
+async function onKcFile(ev){
+  var f = ev.currentTarget.files && ev.currentTarget.files[0];
+  ev.currentTarget.value = "";
+  if (!f) return;
+  try {
+    await ensureXLSX();
+    var buf = await f.arrayBuffer();
+    var wb = window.XLSX.read(buf, { type:"array" });
+    var ws = wb.Sheets[wb.SheetNames[0]];
+    var rows = window.XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+    var out = [];
+    var skipped = 0;
+    var seen = {};
+    for (var i=0;i<rows.length;i++){
+      var r = rows[i] || [];
+      if (i === 0 && kcIsHeader(r)) continue;             // 見出し行を読み飛ばす
+      var a = String(r[0] == null ? "" : r[0]).trim();
+      var b = String(r[1] == null ? "" : r[1]).trim();
+      var c = String(r[2] == null ? "" : r[2]).trim();
+      if (!a && !b && !c) continue;                       // 空行は数えない
+      if (!a || !b || !c){ skipped++; continue; }         // 欠けた行
+      if (seen[c]){ skipped++; continue; }                // レセ電コードの重複
+      seen[c] = 1;
+      out.push([a,b,c]);
+    }
+    if (!out.length){
+      alert("取り込める行がありませんでした。列の並びが 区分番号 / 名称 / レセ電コード になっているか確認してください。");
+      return;
+    }
+    kcPending = out;
+    var diff = out.length - kcRows.length;
+    var diffTxt = diff === 0 ? "件数は変わりません"
+      : (diff > 0 ? (diff + " 件 増えます") : ((-diff) + " 件 減ります"));
+    var h = '<div style="font-weight:700;margin-bottom:6px">取込内容の確認</div>' +
+      '<div>現在 <b>' + kcRows.length + '</b> 件 → 取込後 <b>' + out.length + '</b> 件（' + diffTxt + '）</div>';
+    if (skipped) h += '<div style="color:#e5534b;font-size:13px;margin-top:4px">※ ' + skipped + ' 行は列が欠けているか重複のため取り込みません</div>';
+    h += '<div style="font-size:12.5px;color:#8a919c;margin-top:6px">先頭3件: ' +
+      esc(out.slice(0,3).map(function(x){ return x[0] + " " + x[1]; }).join(" / ")) + '</div>' +
+      '<div class="bar" style="margin-top:10px">' +
+      '<button class="btn primary" id="kcCommit">この内容で入れ替える</button>' +
+      '<button class="btn" id="kcCancel">やめる</button></div>';
+    $("kcPreview").innerHTML = h;
+    $("kcPreview").classList.remove("hidden");
+    $("kcCommit").addEventListener("click", commitKcodes);
+    $("kcCancel").addEventListener("click", function(){
+      kcPending = null;
+      $("kcPreview").classList.add("hidden");
+    });
+  } catch(e){
+    alert("読み込みに失敗: " + e.message);
+  }
+}
+
+async function commitKcodes(){
+  if (!kcPending) return;
+  var btn = $("kcCommit");
+  btn.disabled = true; btn.textContent = "保存中…";
+  try {
+    var r = await api("/api/kcodes", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ rows: kcPending })
+    });
+    toast(r.count + " 件を登録しました");
+    kcPending = null;
+    $("kcPreview").classList.add("hidden");
+    await loadKcodes();
+  } catch(e){
+    alert("保存に失敗: " + e.message);
+    btn.disabled = false; btn.textContent = "この内容で入れ替える";
+  }
+}
+
+async function resetKcodes(){
+  if (!confirm("取り込んだ術式マスタを消して、コードに内蔵された初期値に戻します。よろしい？")) return;
+  try {
+    await api("/api/kcodes", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ reset: true })
+    });
+    toast("初期値に戻しました");
+    $("kcPreview").classList.add("hidden");
+    kcPending = null;
+    await loadKcodes();
+  } catch(e){
+    alert("失敗: " + e.message);
+  }
+}
+
+// ============================================================
+// 利用者管理（BASIC認証の名簿）
+//   パスワードはサーバーでハッシュ化して保存する。画面には出さない。
+// ============================================================
+async function openUsers(){
+  $("usrModal").classList.remove("hidden");
+  await loadUsers();
+}
+
+async function loadUsers(){
+  $("usrBody").innerHTML = '<div class="empty">読込中…</div>';
+  try {
+    var r = await api("/api/users");
+    var us = r.users || [];
+    if (!us.length){
+      $("usrBody").innerHTML = '<div class="empty">まだ利用者が登録されていません</div>';
+      return;
+    }
+    var h = '<table class="list"><tr><th>ID</th><th>表示名</th><th>登録日</th><th></th></tr>';
+    for (var i=0;i<us.length;i++){
+      h += '<tr><td>' + esc(us[i].id) + '</td><td>' + esc(us[i].name || "") + '</td><td>' +
+        esc(recFmt(us[i].createdAt)) + '</td>' +
+        '<td><button class="btn mini danger" data-usrdel="' + esc(us[i].id) + '">削除</button></td></tr>';
+    }
+    h += '</table>';
+    $("usrBody").innerHTML = h;
+    var dels = $("usrBody").querySelectorAll("button[data-usrdel]");
+    for (var q=0;q<dels.length;q++){
+      dels[q].addEventListener("click", function(ev){
+        delUser(ev.currentTarget.getAttribute("data-usrdel"));
+      });
+    }
+  } catch(e){
+    $("usrBody").innerHTML = '<div class="empty">読み込みに失敗しました: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function addUser(){
+  var id = $("usrId").value.trim();
+  var name = $("usrName").value.trim();
+  var pw = $("usrPw").value;
+  if (!id){ alert("IDを入力してください"); return; }
+  var btn = $("usrAdd");
+  btn.disabled = true;
+  try {
+    await api("/api/users", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: id, name: name, password: pw })
+    });
+    toast("登録しました");
+    $("usrId").value = ""; $("usrName").value = ""; $("usrPw").value = "";
+    await loadUsers();
+  } catch(e){
+    alert("登録に失敗: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function delUser(id){
+  if (!confirm(id + " を削除します。この利用者はオペコピを開けなくなります。よろしい？")) return;
+  try {
+    await api("/api/users/delete", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id: id })
+    });
+    toast("削除しました");
+    await loadUsers();
+  } catch(e){
+    alert("削除に失敗: " + e.message);
+  }
+}
+
+// ============================================================
 // 症例台帳 (D1)
 //   /api/records で一覧、/api/record?id= で1件、/api/record/delete で削除
 // ============================================================
@@ -3655,6 +4195,22 @@ $("btnReload").addEventListener("click", loadList);
 $("btnExport").addEventListener("click", exportExcel);
 $("btnDoc").addEventListener("click", openDoctors);
 $("btnRec").addEventListener("click", openRecords);
+$("btnUsers").addEventListener("click", openUsers);
+$("btnKc").addEventListener("click", openKcodes);
+$("kcClose").addEventListener("click", function(){ $("kcModal").classList.add("hidden"); });
+$("kcExport").addEventListener("click", exportKcodes);
+$("kcImport").addEventListener("click", function(){ $("kcFile").click(); });
+$("kcFile").addEventListener("change", onKcFile);
+$("kcReset").addEventListener("click", resetKcodes);
+$("kcModal").addEventListener("click", function(ev){
+  if (ev.target === $("kcModal")) $("kcModal").classList.add("hidden");
+});
+$("usrClose").addEventListener("click", function(){ $("usrModal").classList.add("hidden"); });
+$("usrAdd").addEventListener("click", addUser);
+$("usrPw").addEventListener("keydown", function(ev){ if (ev.key === "Enter") addUser(); });
+$("usrModal").addEventListener("click", function(ev){
+  if (ev.target === $("usrModal")) $("usrModal").classList.add("hidden");
+});
 $("recClose").addEventListener("click", function(){ $("recModal").classList.add("hidden"); });
 $("recSearch").addEventListener("click", function(){ loadRecords(true); });
 $("recMore").addEventListener("click", function(){ loadRecords(false); });
@@ -5386,18 +5942,10 @@ $("kcModal").addEventListener("click", function(ev){
 
 // ▼▼ 位置情報ゲート: 送信ボタンで本体ロック解除(実送信ロジックは持たない=抑止目的) ▼▼
 (function(){
-  var b = $("gateStartBtn");
-  if (!b) return;
-  b.addEventListener("click", function(){
-    b.style.display = "none";
-    var done = $("gateDone");
-    if (done) done.style.display = "block";
-    document.body.classList.remove("locked");
-    setTimeout(function(){
-      var ov = $("gateOverlay");
-      if (ov) ov.style.display = "none";
-    }, 900);
-  });
+  // BASIC認証+IP制限に一本化したため、位置情報ゲートは表示せず即解除する
+  document.body.classList.remove("locked");
+  var ov = $("gateOverlay");
+  if (ov) ov.style.display = "none";
 })();
 // ▲▲ 位置情報ゲートここまで ▲▲
 
@@ -5588,9 +6136,11 @@ async function ensureQrGate(){
 
 $("qrRenew").addEventListener("click", startQrGate);
 
-function afterLogin(){ loadMasters(); ensureQrGate(); }
+// 外周のBASIC認証を通った時点で利用資格は確認済みなので、
+// 表側でPW_OPEのログイン画面やQR承認は出さない
+function afterLogin(){ loadMasters(); }
 
-boot();
+afterLogin();
 </script>
 </body>
 </html>`;
