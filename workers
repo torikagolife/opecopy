@@ -52,6 +52,12 @@ const KV_PREFIX = "master:";
 const DOCTORS_KEY = "staff:doctors";
 const USERS_KEY = "auth:users";   // BASIC認証の利用者名簿(KV)
 const KCODE_KEY = "kcode:list";   // 術式マスタ(Kコード)。KVが空ならコード内の初期値を使う
+const MAILTPL_KEY = "mail:templates";   // 管理者用の定型文(3件)
+const SESS_COOKIE = "ope_sess";         // ログインセッションのCookie名
+const ADMIN_COOKIE = "ope_admin";       // 管理画面(PW_OPE)を通った証のCookie名
+const ADMIN_HOURS = 12;                 // 管理画面セッションの有効時間
+const SESS_DAYS = 7;                    // セッションの有効日数
+const REPORT_KEEP_DAYS = 30;            // 利用者からの報告を保持する日数
 
 // ▼▼ 認証を外したいAPIがあればここに書く ▼▼
 //   既定は空 = すべてのAPIがパスワード保護される。
@@ -89,18 +95,35 @@ export default {
       if (!ipAllowed(request, env)) {
         return new Response("Forbidden", { status: 403 });
       }
-      // ② BASIC認証。名簿(KV)か、非常口(MASTER_ID/MASTER_PW)で照合する
-      const gate = await basicGate(request, env);
+      // ② ログイン確認。Cookie か Authorizationヘッダ(BASIC)で照合する
+      //    ログイン処理そのものは通さないと入口が塞がるので先に通す
+      const isLoginPath = (path === "/login" || path === "/api/session" || path === "/api/logout");
+      const gate = isLoginPath ? { ok: true, user: "" } : await basicGate(request, env);
       if (!gate.ok) {
-        return new Response("Authorization Required", {
-          status: 401,
-          headers: {
-            "WWW-Authenticate": 'Basic realm="opecopy", charset="UTF-8"',
-            "content-type": "text/plain; charset=utf-8",
-          },
-        });
+        // 画面はログインフォームを出す(サイドバーではBASICのダイアログが出せないため)
+        if (method === "GET" && !path.startsWith("/api/")) {
+          return new Response(LOGIN_HTML, {
+            status: 200,
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        }
+        return jsonError("ログインが必要です", 401);
       }
       authUser = gate.user;
+
+      // ---------- ログイン関連 ----------
+      if (method === "GET" && path === "/login") {
+        return new Response(LOGIN_HTML, { status: 200, headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+      if (method === "POST" && path === "/api/session") {
+        return await apiSessionLogin(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/logout") {
+        return apiLogout();
+      }
+      if (method === "GET" && path === "/api/whoami") {
+        return jsonOk({ user: authUser });
+      }
 
       // ---------- 画面 ----------
       if (method === "GET" && (path === "/" || path === "")) {
@@ -109,6 +132,13 @@ export default {
         });
       }
       if (method === "GET" && (path === "/admin" || path === "/admin/")) {
+        // PW_OPEが設定されているならCookieを確認し、無ければログイン画面を返す
+        if (authRequired(env) && !(await readAdminCookie(request, env))) {
+          return new Response(ADMIN_LOGIN_HTML, {
+            status: 200,
+            headers: { "content-type": "text/html; charset=utf-8" },
+          });
+        }
         return new Response(ADMIN_HTML, {
           headers: { "content-type": "text/html; charset=utf-8" },
         });
@@ -195,6 +225,27 @@ export default {
       }
       if (method === "GET" && path === "/api/records") {
         return await listRecords(env, url.searchParams);
+      }
+      if (method === "POST" && path === "/api/icd") {
+        return await apiIcd(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/report") {
+        return await saveReport(env, await request.json(), authUser);
+      }
+      if (method === "GET" && path === "/api/reports") {
+        return await listReports(env);
+      }
+      if (method === "POST" && path === "/api/report/read") {
+        return await markReport(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/report/delete") {
+        return await deleteReport(env, await request.json());
+      }
+      if (method === "GET" && path === "/api/mailtpl") {
+        return await apiGetMailTpl(env);
+      }
+      if (method === "POST" && path === "/api/mailtpl") {
+        return await apiSaveMailTpl(env, await request.json());
       }
       if (method === "GET" && path === "/api/kcodes") {
         return await apiGetKcodes(env);
@@ -287,7 +338,7 @@ async function saveMaster(env, body) {
       if (kw) it.keyword = kw;
       if (rl) it.rule = rl;
       const sg = String(src.suggest || "").trim();
-      if (sg === "kcode" || sg === "doctor") it.suggest = sg;   // 候補リストを出す項目
+      if (sg === "kcode" || sg === "doctor" || sg === "icd10") it.suggest = sg;   // 候補リストを出す項目
     }
     if (type === "sticker") {
       it.source = "label";
@@ -424,6 +475,454 @@ async function deleteRecord(env, body) {
 //   ハードコードせず KV に持つ。管理画面で編集・Excel取込ができる。
 // ============================================================
 // ============================================================
+// ログイン画面
+//   サイドバー(iframe)ではBASIC認証のダイアログが出せないことがあるため、
+//   画面上のフォームからログインできるようにしている
+// ============================================================
+const LOGIN_HTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ログイン | オペコピ</title>
+<style>
+  :root{ --line:#e3e6ea; --ink:#1f2933; --accent:#e8a33d; }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#f4f6f8;color:var(--ink);
+       font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;padding:20px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:30px 26px;
+        width:100%;max-width:340px;box-shadow:0 6px 24px rgba(0,0,0,.06);text-align:center}
+  .emoji{font-size:34px;line-height:1}
+  .title{font-size:19px;font-weight:800;margin:8px 0 2px}
+  .sub{font-size:12.5px;color:#8a919c;margin-bottom:18px}
+  input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;
+        font-size:15px;margin-bottom:10px;font-family:inherit}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{display:block;width:100%;font-size:15px;font-weight:700;padding:12px 0;border:none;
+         border-radius:10px;background:var(--accent);color:#fff;cursor:pointer;margin-top:4px}
+  button:hover{opacity:.9}
+  button:disabled{opacity:.5;cursor:default}
+  #err{color:#e5534b;font-size:13px;margin-top:10px;min-height:18px}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="emoji">\uD83D\uDD10</div>
+    <div class="title">オペコピ</div>
+    <div class="sub">IDとパスワードを入れてください</div>
+    <input type="text" id="uid" placeholder="ID" autocomplete="username" autocapitalize="off" spellcheck="false">
+    <input type="password" id="upw" placeholder="パスワード" autocomplete="current-password">
+    <button id="go">入る</button>
+    <div id="err"></div>
+  </div>
+<script>
+function $(id){ return document.getElementById(id); }
+async function doLogin(){
+  var id = $("uid").value.trim();
+  var pw = $("upw").value;
+  if (!id || !pw){ $("err").textContent = "IDとパスワードを入れてください"; return; }
+  var b = $("go");
+  b.disabled = true; b.textContent = "確認中…";
+  $("err").textContent = "";
+  try {
+    var res = await fetch("/api/session", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ id:id, password:pw })
+    });
+    var data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "ログインできませんでした");
+    // Cookieが遮断される環境(サイドバー等)に備えて控えを残す
+    if (data.token){ try { localStorage.setItem("ope_sess_tok", data.token); } catch(e){} }
+    location.href = "/";
+  } catch(e){
+    $("err").textContent = e.message;
+    b.disabled = false; b.textContent = "入る";
+    $("upw").value = "";
+    $("upw").focus();
+  }
+}
+$("go").addEventListener("click", doLogin);
+$("uid").addEventListener("keydown", function(ev){ if (ev.key === "Enter") $("upw").focus(); });
+$("upw").addEventListener("keydown", function(ev){ if (ev.key === "Enter") doLogin(); });
+$("uid").focus();
+</script>
+</body>
+</html>`;
+
+// ============================================================
+// 管理画面のゲート (PW_OPE)
+//   /admin のHTMLをサーバー側で守る。Cookieが無ければログイン画面を返す。
+//   ※ 利用者ログイン(ope_sess)とは別物。PW_OPEを知っている人だけが通れる
+// ============================================================
+async function makeAdminCookie(env) {
+  const exp = Date.now() + ADMIN_HOURS * 3600000;
+  const sig = await sha256Hex(sessSecret(env) + ":admin:" + exp);
+  return exp + "." + sig;
+}
+
+async function readAdminCookie(request, env) {
+  const raw = String(request.headers.get("Cookie") || "");
+  const m = raw.match(/(?:^|;\s*)ope_admin=([^;]+)/);
+  if (!m) return false;
+  const parts = String(m[1]).split(".");
+  if (parts.length !== 2) return false;
+  const exp = parts[0], sig = parts[1];
+  if (!(Number(exp) > Date.now())) return false;
+  const want = await sha256Hex(sessSecret(env) + ":admin:" + exp);
+  return want === sig;
+}
+
+function adminCookie(value, maxAgeSec) {
+  return ADMIN_COOKIE + "=" + value + COOKIE_TAIL + maxAgeSec;
+}
+
+const ADMIN_LOGIN_HTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>管理画面 | オペコピ</title>
+<style>
+  :root{ --line:#e3e6ea; --ink:#1f2933; --accent:#1d7d76; }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       background:#f4f6f8;color:var(--ink);
+       font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;padding:20px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:16px;padding:30px 26px;
+        width:100%;max-width:340px;box-shadow:0 6px 24px rgba(0,0,0,.06);text-align:center}
+  .emoji{font-size:34px;line-height:1}
+  .title{font-size:19px;font-weight:800;margin:8px 0 2px}
+  .sub{font-size:12.5px;color:#8a919c;margin-bottom:18px}
+  input{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;
+        font-size:15px;margin-bottom:10px;font-family:inherit}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{display:block;width:100%;font-size:15px;font-weight:700;padding:12px 0;border:none;
+         border-radius:10px;background:var(--accent);color:#fff;cursor:pointer;margin-top:4px}
+  button:hover{opacity:.9}
+  button:disabled{opacity:.5;cursor:default}
+  #err{color:#e5534b;font-size:13px;margin-top:10px;min-height:18px}
+  a{display:inline-block;margin-top:14px;font-size:12.5px;color:#8a919c}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="emoji">\u2699\uFE0F</div>
+    <div class="title">管理画面</div>
+    <div class="sub">管理用のパスワードを入れてください</div>
+    <input type="password" id="pw" placeholder="パスワード" autocomplete="current-password">
+    <button id="go">入る</button>
+    <div id="err"></div>
+    <a href="/">\u2190 オペコピに戻る</a>
+  </div>
+<script>
+function $(id){ return document.getElementById(id); }
+async function go(){
+  var pw = $("pw").value;
+  if (!pw){ $("err").textContent = "パスワードを入れてください"; return; }
+  var b = $("go");
+  b.disabled = true; b.textContent = "確認中…";
+  $("err").textContent = "";
+  try {
+    var res = await fetch("/api/login", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ password: pw })
+    });
+    var data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "入れませんでした");
+    location.href = "/admin";
+  } catch(e){
+    $("err").textContent = e.message;
+    b.disabled = false; b.textContent = "入る";
+    $("pw").value = "";
+    $("pw").focus();
+  }
+}
+$("go").addEventListener("click", go);
+$("pw").addEventListener("keydown", function(ev){ if (ev.key === "Enter") go(); });
+$("pw").focus();
+</script>
+</body>
+</html>`;
+
+// ============================================================
+// ログインセッション (Cookie)
+//   BASIC認証のダイアログはサイドバー(iframe)で出せないことがあるため、
+//   画面上のログインフォーム + Cookie でも入れるようにする。
+//   Authorizationヘッダ(BASIC)も従来どおり受け付ける。
+// ============================================================
+function sessSecret(env) {
+  // 環境変数から鍵を作る。値そのものは外に出さない
+  return "opecopy-session-v1|" + String((env && env.MASTER_PW) || "") + "|" + String((env && env.PW_OPE) || "");
+}
+
+async function makeSession(env, user) {
+  const exp = Date.now() + SESS_DAYS * 86400000;
+  const u = encodeURIComponent(String(user));
+  const sig = await sha256Hex(sessSecret(env) + ":" + u + ":" + exp);
+  return u + "." + exp + "." + sig;
+}
+
+// セッション文字列(user.exp.sig)を検証してユーザー名を返す。ダメなら空文字
+async function verifySessionToken(tok, env) {
+  const parts = String(tok || "").split(".");
+  if (parts.length !== 3) return "";
+  const u = parts[0], exp = parts[1], sig = parts[2];
+  if (!(Number(exp) > Date.now())) return "";
+  const want = await sha256Hex(sessSecret(env) + ":" + u + ":" + exp);
+  if (want !== sig) return "";
+  try { return decodeURIComponent(u); } catch (e) { return ""; }
+}
+
+async function readSession(request, env) {
+  // Cookieが使えない環境(iframeでの遮断など)のために、ヘッダでも受け取れるようにする
+  const hdr = String(request.headers.get("x-ope-sess") || "").trim();
+  if (hdr) {
+    const u = await verifySessionToken(hdr, env);
+    if (u) return u;
+  }
+  const raw = String(request.headers.get("Cookie") || "");
+  const m = raw.match(/(?:^|;\s*)ope_sess=([^;]+)/);
+  if (!m) return "";
+  const parts = String(m[1]).split(".");
+  if (parts.length !== 3) return "";
+  const u = parts[0], exp = parts[1], sig = parts[2];
+  if (!(Number(exp) > Date.now())) return "";
+  const want = await sha256Hex(sessSecret(env) + ":" + u + ":" + exp);
+  if (want !== sig) return "";
+  try { return decodeURIComponent(u); } catch (e) { return ""; }
+}
+
+// サイドバー(拡張のiframe)は別サイト扱いになるため SameSite=Lax だとCookieが送られない。
+// None を指定し、Chromeの3rdパーティCookie廃止に備えて Partitioned も付ける
+// (Partitionedを知らないブラウザは無視するだけなので害はない)。
+const COOKIE_TAIL = "; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=";
+
+function sessionCookie(value, maxAgeSec) {
+  return SESS_COOKIE + "=" + value + COOKIE_TAIL + maxAgeSec;
+}
+
+// IDとパスワードを名簿・非常口の順に照合する
+async function verifyCredential(env, id, pw) {
+  const uid = String(id || "");
+  if (!uid) return false;
+  if (env && env.MASTER_ID && env.MASTER_PW && uid === String(env.MASTER_ID) && String(pw) === String(env.MASTER_PW)) {
+    return true;
+  }
+  const users = await loadUsers(env);
+  for (const u of users) {
+    if (u && u.id === uid) {
+      const h = await userHash(uid, String(pw));
+      return h === u.hash;
+    }
+  }
+  return false;
+}
+
+async function apiSessionLogin(env, body) {
+  const b = body || {};
+  const id = String(b.id || "").trim();
+  const pw = String(b.password || "");
+  if (!id || !pw) return jsonError("IDとパスワードを入力してください", 400);
+  const ok = await verifyCredential(env, id, pw);
+  if (!ok) return jsonError("IDまたはパスワードが違います", 401);
+  const tok = await makeSession(env, id);
+  // tokenも返す。Cookieが遮断される環境ではこれを保存してヘッダで送る
+  return new Response(JSON.stringify({ ok: true, user: id, token: tok }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "Set-Cookie": sessionCookie(tok, SESS_DAYS * 86400),
+    },
+  });
+}
+
+function apiLogout() {
+  const h = new Headers({ "content-type": "application/json; charset=utf-8" });
+  h.append("Set-Cookie", sessionCookie("", 0));
+  h.append("Set-Cookie", adminCookie("", 0));   // 管理画面のゲートも同時に閉じる
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: h });
+}
+
+// ============================================================
+// 利用者からの報告 (D1: reports)
+//   30日を過ぎたものは一覧を開いたときに自動で消える
+// ============================================================
+async function saveReport(env, body, authUser) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const b = body || {};
+  const text = String(b.body || "").trim();
+  if (!text) return jsonError("報告の内容を入力してください", 400);
+  if (text.length > 2000) return jsonError("報告は2000文字までにしてください", 400);
+  const now = new Date().toISOString();
+  await env.opecopy_db.prepare(
+    "INSERT INTO reports (created_at, created_by, master_id, master_name, body, status) VALUES (?,?,?,?,?,'new')"
+  ).bind(now, String(authUser || ""), b.master_id || null, b.master_name || null, text).run();
+  return jsonOk({ saved: true });
+}
+
+async function purgeOldReports(env) {
+  const limit = new Date(Date.now() - REPORT_KEEP_DAYS * 86400000).toISOString();
+  try {
+    await env.opecopy_db.prepare("DELETE FROM reports WHERE created_at < ?").bind(limit).run();
+  } catch (e) {
+    // 消せなくても一覧の表示は続ける
+  }
+}
+
+async function listReports(env) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  await purgeOldReports(env);
+  const rs = await env.opecopy_db.prepare(
+    "SELECT * FROM reports ORDER BY (status='new') DESC, id DESC LIMIT 200"
+  ).all();
+  return jsonOk({ reports: (rs && rs.results) || [], keepDays: REPORT_KEEP_DAYS });
+}
+
+async function markReport(env, body) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const id = Number((body && body.id) || 0);
+  if (!id) return jsonError("idが不正です", 400);
+  const now = new Date().toISOString();
+  await env.opecopy_db.prepare("UPDATE reports SET status='read', read_at=? WHERE id=?").bind(now, id).run();
+  return jsonOk({ id: id, read: true });
+}
+
+async function deleteReport(env, body) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const id = Number((body && body.id) || 0);
+  if (!id) return jsonError("idが不正です", 400);
+  await env.opecopy_db.prepare("DELETE FROM reports WHERE id=?").bind(id).run();
+  return jsonOk({ id: id, deleted: true });
+}
+
+// ============================================================
+// 管理者用の定型文 (KV) — 3件
+// ============================================================
+const MAILTPL_DEFAULT = [
+  { title: "利用者登録のお知らせ", body: "オペコピの利用者登録が完了しました。\n\nID: デスクネッツのアカウントの@より前\nパスワード: \n\nログイン後の使い方はマニュアルを参照してください。\nパスワードは各自で変更できません。変更が必要なときはDA課までご連絡ください。" },
+  { title: "パスワード再発行", body: "オペコピのパスワードを再発行しました。\n\nID: \n新しいパスワード: \n\n引き続きご利用ください。ご不明な点はDA課までご連絡ください。" },
+  { title: "メンテナンスのお知らせ", body: "オペコピは下記の時間帯にメンテナンスを行います。\n\n日時: \n影響: 読み取りができません\n\nご不便をおかけしますがよろしくお願いします。" },
+];
+
+async function apiGetMailTpl(env) {
+  let items = null;
+  if (env && env.FORM_KV) {
+    try {
+      const raw = await env.FORM_KV.get(MAILTPL_KEY);
+      if (raw) {
+        const obj = JSON.parse(raw);
+        if (Array.isArray(obj.items)) items = obj.items;
+      }
+    } catch (e) {}
+  }
+  if (!items) items = MAILTPL_DEFAULT;
+  // 常に3件そろえて返す
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const it = items[i] || { title: "", body: "" };
+    out.push({ title: String(it.title || ""), body: String(it.body || "") });
+  }
+  return jsonOk({ items: out });
+}
+
+async function apiSaveMailTpl(env, body) {
+  if (!env.FORM_KV) return jsonError("KVバインディング FORM_KV が設定されていません", 500);
+  const src = (body && Array.isArray(body.items)) ? body.items : [];
+  const items = [];
+  for (let i = 0; i < 3; i++) {
+    const it = src[i] || {};
+    items.push({ title: String(it.title || "").slice(0, 100), body: String(it.body || "").slice(0, 4000) });
+  }
+  await env.FORM_KV.put(MAILTPL_KEY, JSON.stringify({ items: items, updatedAt: new Date().toISOString() }));
+  return jsonOk({ saved: true });
+}
+
+// ============================================================
+// 病名候補 (ICD-10) — リストを送らずモデルの知識だけで出す
+//   件数が3万件近くあり全件をプロンプトに載せると高額になるため、
+//   ここでは「診療情報管理士の知識」に頼る方式にしている。
+//   そのぶんコードの正確性は保証できないので、画面側で確認を促すこと。
+// ============================================================
+const MODEL_ICD = "gpt-4o-mini";
+
+const ICD_SCHEMA = {
+  name: "icd_candidates",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string" },
+            kana: { type: "string" },
+            icd10: { type: "string" },
+            reason: { type: "string" },
+          },
+          required: ["name", "kana", "icd10", "reason"],
+        },
+      },
+    },
+    required: ["results"],
+  },
+};
+
+const ICD_SYSTEM = [
+  "あなたは勤続20年のベテラン診療情報管理士です。日本の整形外科領域を専門とし、ICD-10(2013年版準拠)によるコーディングを日常業務として何万件も処理してきました。",
+  "レセプト病名と標準病名マスター(MEDIS)の表記に精通しており、臨床医が書いた略語・英語・通称・カルテ特有の崩れた表記から、正式な標準病名を言い当てることができます。",
+  "",
+  "# 依頼",
+  "入力された病名表現に対し、日本の標準病名マスターに実在する正式病名を、確からしい順に5件挙げてください。",
+  "",
+  "# 厳守事項",
+  "- name は日本の標準病名マスターに実在する正式表記で書くこと。自分で語を組み立てて新しい病名を作らないこと。",
+  "- icd10 は英字1文字+数字2桁、必要なら小数点以下1桁まで(例: M17.1, S72.0, M75.1)。分類が確定できない場合でも、最も近い3桁分類(例: M17)を返すこと。",
+  "- kana は name の読みを全角カタカナで書くこと。",
+  "- reason は選定理由を20文字以内で簡潔に書くこと。",
+  "- 部位・左右・急性慢性の区別が入力にある場合は、それを反映した病名を優先すること。",
+  "- 入力が整形外科領域でない場合も、分かる範囲で最も近い病名を挙げること。",
+  "- 5件は必ず異なる病名にすること。同じ病名の表記違いを並べないこと。",
+].join("\n");
+
+async function apiIcd(env, body) {
+  const query = String((body && body.query) || "").trim();
+  if (!query) return jsonError("病名を入力してください", 400);
+  if (query.length > 100) return jsonError("入力が長すぎます(100文字まで)", 400);
+  if (!env.OPENAI_API_KEY) return jsonError("OPENAI_API_KEY が設定されていません", 500);
+
+  const out = await callOpenAI(
+    env, MODEL_ICD,
+    [
+      { role: "system", content: ICD_SYSTEM },
+      { role: "user", content: "# 入力された病名\n" + query },
+    ],
+    1000, ICD_SCHEMA
+  );
+
+  const raw = (out.json && out.json.results) || [];
+  const results = [];
+  const seen = {};
+  for (const r of raw) {
+    const nm = String(r.name || "").trim();
+    if (!nm || seen[nm]) continue;
+    seen[nm] = 1;
+    // コードの体裁だけ整える(英字1文字+数字。小数点以下は1桁まで)
+    let code = String(r.icd10 || "").trim().toUpperCase().replace(/[^A-Z0-9.]/g, "");
+    const mm = code.match(/^([A-Z][0-9]{2})(?:\.?([0-9]))?$/);
+    code = mm ? (mm[1] + (mm[2] ? "." + mm[2] : "")) : code;
+    results.push({ name: nm, kana: String(r.kana || ""), icd10: code, reason: String(r.reason || "") });
+    if (results.length >= 5) break;
+  }
+  if (!results.length) return jsonError("候補が見つかりませんでした。表現を変えて検索してください", 200);
+  return jsonOk({ results: results, usage: out.usage || null });
+}
+
+// ============================================================
 // 外周ゲート（IP制限 + BASIC認証）
 //   ・ALLOW_IPS  … 許可する送信元グローバルIP。カンマ区切り。CIDR可。未設定なら制限しない
 //   ・MASTER_ID / MASTER_PW … 名簿が壊れても入れる非常口。画面には一切出さない
@@ -520,6 +1019,15 @@ async function basicGate(request, env) {
   // 名簿も非常口も無い＝まだ設定前。締め出さないよう素通しにする
   if (!users.length && !hasMaster) return { ok: true, user: "" };
 
+  // ① ログインフォームで発行したCookie
+  const sess = await readSession(request, env);
+  if (sess) {
+    if (hasMaster && sess === String(env.MASTER_ID)) return { ok: true, user: sess };
+    for (const u of users) if (u && u.id === sess) return { ok: true, user: sess };
+    // 名簿から消された利用者のCookieは無効
+  }
+
+  // ② Authorizationヘッダ(BASIC)
   const cred = decodeBasic(request);
   if (!cred || !cred.id) return { ok: false, user: "" };
 
@@ -540,6 +1048,9 @@ async function basicGate(request, env) {
 function isAdminApi(method, path) {
   if (path === "/api/users" || path === "/api/users/delete") return true;
   if (path === "/api/kcodes") return true;
+  if (path === "/api/reports") return true;
+  if (path === "/api/report/read" || path === "/api/report/delete") return true;
+  if (path === "/api/mailtpl") return true;
   if (path === "/api/records") return true;
   if (path === "/api/record/delete") return true;
   if (path === "/api/record" && method === "GET") return true;
@@ -622,15 +1133,24 @@ async function authToken(env) {
 async function checkAuth(request, env) {
   if (!authRequired(env)) return true;
   const t = request.headers.get("x-ope-auth") || "";
-  if (!t) return false;
-  return t === (await authToken(env));
+  if (t && t === (await authToken(env))) return true;
+  // 管理画面のCookieでも通す(サイドバー等でヘッダが送れない場合の保険)
+  return await readAdminCookie(request, env);
 }
 
 async function apiLogin(env, body) {
   if (!authRequired(env)) return jsonOk({ token: "", required: false });
   const pw = String((body && body.password) || "");
   if (!pw || pw !== String(env.PW_OPE)) return jsonError("パスワードが違います", 401);
-  return jsonOk({ token: await authToken(env), required: true });
+  // ヘッダ用のトークンに加えて、/admin のページ自体を通すためのCookieも発行する
+  const ck = await makeAdminCookie(env);
+  return new Response(JSON.stringify({ ok: true, token: await authToken(env), required: true }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "Set-Cookie": adminCookie(ck, ADMIN_HOURS * 3600),
+    },
+  });
 }
 
 // ============================================================
@@ -2542,19 +3062,38 @@ const ADMIN_HTML = `<!DOCTYPE html>
 
   <div class="top">
     <h1>\uD83D\uDCCB オペコピ</h1>
-    <small>対象用紙マスタ管理</small>
+    <small>管理画面</small>
+    <span id="meBox" style="margin-left:auto;font-size:12.5px;color:#8a919c;align-self:center"></span>
+    <a href="/">\uD83D\uDCCB オペコピに戻る</a>
+    <a href="#" id="btnLogout">\uD83D\uDEAA ログアウト</a>
   </div>
 
-  <!-- ============ 一覧ビュー ============ -->
-  <section id="listView">
+  <!-- ============ ホーム(既定) ============ -->
+  <section id="homeView">
     <div class="bar">
-      <button class="btn primary" id="btnNew">➕ 新規作成</button>
-      <button class="btn teal" id="btnImport">\uD83D\uDCE5 Excelから取込</button>
-      <button class="btn" id="btnExport">\uD83D\uDCE4 Excel書き出し</button>
+      <button class="btn primary" id="btnToMasters">\uD83D\uDCD1 対象用紙マスタ</button>
       <button class="btn" id="btnDoc">\uD83D\uDC68‍⚕️ 医師マスタ</button>
       <button class="btn" id="btnRec">\uD83D\uDCD2 症例台帳</button>
       <button class="btn" id="btnKc">\uD83E\uDE7A 術式マスタ</button>
       <button class="btn" id="btnUsers">\uD83D\uDD11 利用者管理</button>
+      <button class="btn" id="btnHomeReload">\uD83D\uDD04 再読込</button>
+    </div>
+
+    <div style="font-weight:700;margin:16px 0 8px">\uD83D\uDCE3 利用者からの報告 <span class="hint" id="rpCount" style="font-weight:400"></span></div>
+    <div id="rpBody2"><div class="empty">読込中…</div></div>
+
+    <div style="font-weight:700;margin:22px 0 8px">\u2709\uFE0F 定型文</div>
+    <div class="hint" style="margin-bottom:8px">利用者へ送る文面をここに置いておけます。コピーしてメールに貼ってください。</div>
+    <div id="tplBody"><div class="empty">読込中…</div></div>
+  </section>
+
+  <!-- ============ 一覧ビュー ============ -->
+  <section id="listView" class="hidden">
+    <div class="bar">
+      <button class="btn" id="btnToHome">← ホーム</button>
+      <button class="btn primary" id="btnNew">➕ 新規作成</button>
+      <button class="btn teal" id="btnImport">\uD83D\uDCE5 Excelから取込</button>
+      <button class="btn" id="btnExport">\uD83D\uDCE4 Excel書き出し</button>
       <button class="btn" id="btnReload">\uD83D\uDD04 再読込</button>
     </div>
     <div id="listBody"><div class="empty"><span class="spin"></span> 読込中…</div></div>
@@ -2874,6 +3413,8 @@ async function api(path, opt){
   if (opt.headers){ for (var k in opt.headers) h[k] = opt.headers[k]; }
   var t = getToken();
   if (t) h["x-ope-auth"] = t;
+  var st = getSessTok();
+  if (st) h["x-ope-sess"] = st;      // Cookieが送れない環境の保険
   opt.headers = h;
   var res = await fetch(path, opt);
   if (res.status === 401){ clearToken(); showLogin(); throw new Error("認証が必要です"); }
@@ -3068,6 +3609,7 @@ function itemCard(it, idx, total){
     second += '<div class="fld"><label>候補リスト</label><select class="w150" data-f="suggest" data-idx="' + idx + '">' +
       '<option value=""' + (it.suggest ? "" : " selected") + '>なし</option>' +
       '<option value="kcode"' + (it.suggest === "kcode" ? " selected" : "") + '>\uD83D\uDD0D 登録術式(Kコード)</option>' +
+      '<option value="icd10"' + (it.suggest === "icd10" ? " selected" : "") + '>\uD83E\uDE7A 病名(ICD-10・AI推定)</option>' +
       '<option value="doctor"' + (it.suggest === "doctor" ? " selected" : "") + '>\uD83D\uDC68‍⚕️ 医師マスタ</option>' +
       '</select></div>';
   }
@@ -3359,6 +3901,7 @@ function sheetToItems(rows){
       if (kw) it.keyword = kw;
       if (rule) it.rule = rule;
       if (sug === "kcode") it.suggest = "kcode";
+      else if (sug === "icd10") it.suggest = "icd10";
     }
     if (type === "sticker"){
       it.source = "label";
@@ -3740,6 +4283,184 @@ async function exportExcel(){
 // ============================================================
 // イベント配線
 // ============================================================
+// ============================================================
+// ホーム（利用者からの報告 と 定型文）
+// ============================================================
+// クリップボードへコピー（管理画面のJSONコピーと同じ方式）
+function copyText(t){
+  var ta = document.createElement("textarea");
+  ta.value = String(t == null ? "" : t);
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand("copy"); } catch(e){}
+  document.body.removeChild(ta);
+  if (ok) toast("コピーしました"); else alert("コピーに失敗しました");
+}
+
+function showHome(){
+  $("homeView").classList.remove("hidden");
+  $("listView").classList.add("hidden");
+  $("editView").classList.add("hidden");
+  loadHome();
+}
+
+function showMasters(){
+  $("homeView").classList.add("hidden");
+  $("listView").classList.remove("hidden");
+  $("editView").classList.add("hidden");
+  loadList();
+}
+
+async function loadHome(){
+  await Promise.all([loadReports(), loadTemplates()]);
+}
+
+// ---- 利用者からの報告 ----
+async function loadReports(){
+  $("rpBody2").innerHTML = '<div class="empty">読込中…</div>';
+  try {
+    var r = await api("/api/reports");
+    var rs = r.reports || [];
+    var unread = 0;
+    for (var i=0;i<rs.length;i++) if (rs[i].status !== "read") unread++;
+    $("rpCount").textContent = rs.length ? ("未確認 " + unread + " 件 / 全 " + rs.length + " 件（" + (r.keepDays || 30) + "日で自動削除）") : "";
+    if (!rs.length){
+      $("rpBody2").innerHTML = '<div class="empty">まだ報告はありません</div>';
+      return;
+    }
+    var h = "";
+    for (var j=0;j<rs.length;j++){
+      var x = rs[j];
+      var isNew = (x.status !== "read");
+      h += '<div style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;' +
+             (isNew ? 'background:#fffaf2;border-color:#e8c98d' : 'background:#fff') + '">' +
+           '<div style="font-size:12px;color:#8a919c;margin-bottom:4px">' +
+             (isNew ? '<b style="color:#c9821a">未確認</b>　' : '') +
+             esc(recFmt(x.created_at)) +
+             (x.created_by ? '　' + esc(x.created_by) : '') +
+             (x.master_name ? '　[' + esc(x.master_name) + ']' : '') +
+           '</div>' +
+           '<div style="white-space:pre-wrap;font-size:14px">' + esc(x.body || "") + '</div>' +
+           '<div class="bar" style="margin-top:8px">' +
+             (isNew ? '<button class="btn mini" data-rpread="' + esc(x.id) + '">\u2714 確認</button>' : '') +
+             '<button class="btn mini danger" data-rpdel="' + esc(x.id) + '">削除</button>' +
+           '</div>' +
+           '</div>';
+    }
+    $("rpBody2").innerHTML = h;
+    var reads = $("rpBody2").querySelectorAll("button[data-rpread]");
+    for (var a=0;a<reads.length;a++){
+      reads[a].addEventListener("click", function(ev){ markReport(ev.currentTarget.getAttribute("data-rpread")); });
+    }
+    var dels = $("rpBody2").querySelectorAll("button[data-rpdel]");
+    for (var b=0;b<dels.length;b++){
+      dels[b].addEventListener("click", function(ev){ delReport(ev.currentTarget.getAttribute("data-rpdel")); });
+    }
+  } catch(e){
+    $("rpBody2").innerHTML = '<div class="empty">読み込みに失敗しました: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function markReport(id){
+  try {
+    await api("/api/report/read", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ id: Number(id) })
+    });
+    await loadReports();
+  } catch(e){ alert("失敗: " + e.message); }
+}
+
+async function delReport(id){
+  if (!confirm("この報告を削除します。よろしい？")) return;
+  try {
+    await api("/api/report/delete", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ id: Number(id) })
+    });
+    toast("削除しました");
+    await loadReports();
+  } catch(e){ alert("失敗: " + e.message); }
+}
+
+// ---- 定型文 ----
+var tplItems = [];
+
+async function loadTemplates(){
+  $("tplBody").innerHTML = '<div class="empty">読込中…</div>';
+  try {
+    var r = await api("/api/mailtpl");
+    tplItems = r.items || [];
+    var h = "";
+    for (var i=0;i<tplItems.length;i++){
+      h += '<div style="border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;background:#fff">' +
+             '<input type="text" data-tpltitle="' + i + '" value="' + esc(tplItems[i].title || "") + '" placeholder="件名" ' +
+               'style="width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font-size:13.5px;font-weight:700;font-family:inherit">' +
+             '<textarea data-tplbody="' + i + '" spellcheck="false" placeholder="本文" ' +
+               'style="width:100%;min-height:110px;margin-top:6px;padding:9px;border:1px solid var(--line);border-radius:8px;font-family:inherit;font-size:13.5px">' +
+               esc(tplItems[i].body || "") + '</textarea>' +
+             '<div class="bar" style="margin-top:6px">' +
+               '<button class="btn mini" data-tplcopy="' + i + '">\uD83D\uDCCB 本文をコピー</button>' +
+             '</div>' +
+           '</div>';
+    }
+    h += '<div class="bar"><button class="btn primary" id="tplSave">\uD83D\uDCBE 定型文を保存</button></div>';
+    $("tplBody").innerHTML = h;
+
+    var cps = $("tplBody").querySelectorAll("button[data-tplcopy]");
+    for (var c=0;c<cps.length;c++){
+      cps[c].addEventListener("click", function(ev){
+        var idx = ev.currentTarget.getAttribute("data-tplcopy");
+        var ta = $("tplBody").querySelector('textarea[data-tplbody="' + idx + '"]');
+        copyText(ta ? ta.value : "");
+      });
+    }
+    $("tplSave").addEventListener("click", saveTemplates);
+  } catch(e){
+    $("tplBody").innerHTML = '<div class="empty">読み込みに失敗しました: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function saveTemplates(){
+  var items = [];
+  for (var i=0;i<3;i++){
+    var ti = $("tplBody").querySelector('input[data-tpltitle="' + i + '"]');
+    var bo = $("tplBody").querySelector('textarea[data-tplbody="' + i + '"]');
+    items.push({ title: ti ? ti.value : "", body: bo ? bo.value : "" });
+  }
+  var btn = $("tplSave");
+  btn.disabled = true; btn.textContent = "保存中…";
+  try {
+    await api("/api/mailtpl", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ items: items })
+    });
+    toast("定型文を保存しました");
+  } catch(e){
+    alert("保存に失敗: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "\uD83D\uDCBE 定型文を保存";
+  }
+}
+
+// ---- ログイン中の利用者 / ログアウト ----
+async function loadMe(){
+  try {
+    var r = await api("/api/whoami");
+    if (r.user) $("meBox").textContent = r.user + " でログイン中";
+  } catch(e){}
+}
+
+async function doLogout(){
+  if (!confirm("ログアウトします。よろしい？")) return;
+  try { await api("/api/logout", { method:"POST" }); } catch(e){}
+  try { localStorage.removeItem("ope_sess_tok"); } catch(e){}
+  location.href = "/login";
+}
+
 // ============================================================
 // 術式マスタ (Kコード) — KV保存。Excelの往復で改訂に対応する
 // ============================================================
@@ -4241,6 +4962,11 @@ var AUTH_KEY = "opecopy_auth";
 // サイドバー(拡張のiframe)ではブラウザ設定によりlocalStorageが使えないことがある。
 // その場合でもタブを閉じるまでは動くよう、メモリ上にも控えを持つ。
 var memAuth = "";
+// ログインセッションの控え(Cookieが遮断される環境の保険)
+function getSessTok(){
+  try { return localStorage.getItem("ope_sess_tok") || ""; } catch(e){ return ""; }
+}
+
 function getToken(){
   try { var v = localStorage.getItem(AUTH_KEY); if (v) return v; } catch(e){}
   return memAuth;
@@ -4292,7 +5018,12 @@ async function boot(){
 $("loginBtn").addEventListener("click", doLogin);
 $("loginPw").addEventListener("keydown", function(ev){ if (ev.key === "Enter") doLogin(); });
 
-function afterLogin(){ loadList(); }
+function afterLogin(){ showHome(); loadMe(); }
+
+$("btnToMasters").addEventListener("click", showMasters);
+$("btnToHome").addEventListener("click", showHome);
+$("btnHomeReload").addEventListener("click", loadHome);
+$("btnLogout").addEventListener("click", function(ev){ ev.preventDefault(); doLogout(); });
 
 boot();
 
@@ -4567,7 +5298,10 @@ const FRONT_HTML = `<!DOCTYPE html>
   <div class="top">
     <h1>\uD83D\uDCCB オペコピ</h1>
     <small>手術記録用紙 → JOANR入力補助</small>
+    <span id="meBox" style="margin-left:auto;font-size:12.5px;color:#8a919c;align-self:center"></span>
+    <a href="#" id="btnReport">\uD83D\uDCE3 報告</a>
     <a href="/admin">⚙️ 管理画面</a>
+    <a href="#" id="btnLogout">\uD83D\uDEAA ログアウト</a>
   </div>
 
   <!-- STEP 1 -->
@@ -4645,6 +5379,41 @@ const FRONT_HTML = `<!DOCTYPE html>
 </div>
 <!-- ▲▲ ログインここまで ▲▲ -->
 
+<!-- ▼▼ 報告 ▼▼ -->
+<div class="overlay hidden" id="rpModal">
+  <div class="modal">
+    <div class="mhead">\uD83D\uDCE3 管理者へ報告</div>
+    <div class="mbody">
+      <div class="hint">読み取りのミスやマスタの直してほしい所を書いてください。総務の管理画面に届きます（30日で自動的に消えます）。</div>
+      <textarea id="rpBody" spellcheck="false" style="width:100%;min-height:150px;padding:10px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:14px;margin-top:8px" placeholder="例) TKAの「手術時間」がよく読み取れていません。用紙の右下にあります。マスタの見直しをお願いします。"></textarea>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="rpClose">閉じる</button>
+      <button class="btn primary" id="rpSend">\uD83D\uDCE4 送る</button>
+    </div>
+  </div>
+</div>
+<!-- ▲▲ 報告ここまで ▲▲ -->
+
+<!-- ▼▼ 病名候補(ICD-10) ▼▼ -->
+<div class="overlay hidden" id="icModal">
+  <div class="modal">
+    <div class="mhead">\uD83E\uDE7A 病名の候補 (ICD-10)<small style="display:block;font-weight:400;color:#8a919c;font-size:12px;margin-top:3px">病名リストは使わず、AIの知識から推定しています</small></div>
+    <div class="mbody">
+      <div class="bar">
+        <input type="text" id="icQuery" class="wide" placeholder="例) 変形性膝関節症 右">
+        <button class="btn primary" id="icRun">\uD83D\uDD0D 検索</button>
+      </div>
+      <div class="hint" style="margin-top:6px">AIの知識から候補を出しています。<b>ICD-10コードは必ず確認してから使ってください。</b></div>
+      <div id="icList" style="margin-top:10px"></div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="icClose">閉じる</button>
+    </div>
+  </div>
+</div>
+<!-- ▲▲ 病名候補ここまで ▲▲ -->
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -4692,6 +5461,8 @@ async function api(path, opt){
   if (t) h["x-ope-auth"] = t;
   var q = getQrToken();
   if (q) h["x-ope-qr"] = q;
+  var st = getSessTok();
+  if (st) h["x-ope-sess"] = st;      // Cookieが送れない環境の保険
   opt.headers = h;
   var res = await fetch(path, opt);
   if (res.status === 401){
@@ -5148,9 +5919,11 @@ function updateRunBtn(){
 
 // ▼▼ 台帳保存の項目マッピング — 自分のマスタのラベルに合わせて調整 ▼▼
 //   下のラベル群は「部分一致」で判定する。実際の用紙のラベル表記に合わせて増減させて。
-var SAVE_PATIENT_ID_LABELS   = ["患者ID", "患者ＩＤ", "患者番号", "ID"];
+var SAVE_PATIENT_ID_LABELS   = ["患者ID", "患者ＩＤ", "患者番号", "ID"];   // ← patient_no列(B列)の元。読んだ生の値のまま保存する
+var SAVE_BUMP_LABELS         = ["加工ID"];                                 // ← この項目(O列)だけ +1 する
 var SAVE_SURGERY_DATE_LABELS = ["手術日", "手術年月日", "実施日"];
 var SAVE_NAME_LABELS         = ["氏名", "患者氏名", "患者名", "名前"];   // ← これらは保存しない
+var SAVE_DURATION_LABELS     = ["手術時間", "麻酔時間"];                 // ← h:mm に直して保存する
 
 function saveLabelHit(label, list){
   var s = String(label == null ? "" : label);
@@ -5158,20 +5931,56 @@ function saveLabelHit(label, list){
   return false;
 }
 function isSavePatientId(label){ return saveLabelHit(label, SAVE_PATIENT_ID_LABELS); }
+function isSaveBump(label){ return saveLabelHit(label, SAVE_BUMP_LABELS); }
 function isSaveSurgeryDate(label){ return saveLabelHit(label, SAVE_SURGERY_DATE_LABELS); }
 function isSaveName(label){ return saveLabelHit(label, SAVE_NAME_LABELS); }
+function isSaveDuration(label){ return saveLabelHit(label, SAVE_DURATION_LABELS); }
 
 // 患者IDの表示加工(+1)。
 //   ※ results の中身が「生ID」の場合は、ここで +1 する。
 //   ※ もし画面表示の時点で既に +1 済みの値が results に入っているなら、
 //      二重加工を防ぐため、この関数は s をそのまま返すように直すこと。
 function bumpPatientId(v){
-  // マスタ設定の段階で既に+1済みの値が results に入るため、ここでは加工しない
-  return String(v == null ? "" : v).trim();
+  // 「加工ID」の項目だけに使う。患者IDに+1した数値にする。
+  // 0000222415 → 0000222416 のように、先頭のゼロ埋めの桁数はそのまま保つ。
+  var s = String(v == null ? "" : v).trim();
+  if (s === "") return "";
+  if (!/^[0-9]+$/.test(s)) return s;          // 数字だけでなければ触らない
+  var n = String(Number(s) + 1);
+  while (n.length < s.length) n = "0" + n;    // 元の桁数までゼロで埋め直す
+  return n;
+}
+
+// 読み取り結果のうち、時間の項目をまとめて h:mm に直す。
+// 画面の表示・コピー・台帳への保存がすべて同じ形になる。
+function normalizeDurationFields(){
+  var items = (curMaster && curMaster.items) || [];
+  for (var i = 0; i < items.length; i++){
+    var it = items[i];
+    if (!isSaveDuration(it.label || "")) continue;
+    var key = String(it.no);
+    if (results[key] == null || results[key] === "") continue;
+    results[key] = normalizeDuration(results[key]);
+  }
+}
+
+// 「2時間25分」→「2:25」。後から集計しやすい形にそろえる
+function normalizeDuration(v){
+  var s = String(v == null ? "" : v).trim();
+  if (s === "") return "";
+  // テンプレートリテラル内ではバックスラッシュが失われるため、正規表現は文字クラスで書く
+  var SP = "[ \u3000]*";
+  var m = s.match(new RegExp("^([0-9]+)" + SP + "時間" + SP + "(?:([0-9]+)" + SP + "分)?$"));
+  if (m) return m[1] + ":" + ("0" + (m[2] || "0")).slice(-2);
+  m = s.match(new RegExp("^([0-9]+)" + SP + "分$"));
+  if (m) return "0:" + ("0" + m[1]).slice(-2);
+  m = s.match(new RegExp("^([0-9]+)" + SP + "[:：]" + SP + "([0-9]{1,2})$"));
+  if (m) return m[1] + ":" + ("0" + m[2]).slice(-2);   // 既に h:mm ならゼロ埋めだけ
+  return s;                                            // 読めない形はそのまま
 }
 // ▲▲ ここまで調整ゾーン ▲▲
 
-// results を保存用ペイロードに整形する。氏名は落とし、患者IDは +1 後の値にする。
+// results を保存用ペイロードに整形する。氏名は落とし、加工IDだけ +1 した値にする。
 function buildRecordPayload(){
   var items = (curMaster && curMaster.items) || [];
   var fields = [];
@@ -5181,7 +5990,9 @@ function buildRecordPayload(){
     if (isSaveName(label)) continue;                 // 氏名は保存しない
     var raw = results[String(it.no)];
     raw = (raw == null ? "" : String(raw));
-    var val = isSavePatientId(label) ? bumpPatientId(raw) : raw;
+    var val = raw;
+    if (isSaveBump(label)) val = bumpPatientId(raw);            // 加工IDだけ +1
+    else if (isSaveDuration(label)) val = normalizeDuration(raw);
     fields.push({ no: it.no, label: label, type: it.type || "", value: val });
   }
   return { fields: fields, materials: (typeof subVals === "object" ? subVals : {}) };
@@ -5190,7 +6001,10 @@ function buildRecordPayload(){
 function pickPatientNo(){
   var items = (curMaster && curMaster.items) || [];
   for (var i = 0; i < items.length; i++){
-    if (isSavePatientId(items[i].label || "")) return bumpPatientId(results[String(items[i].no)]);
+    if (isSavePatientId(items[i].label || "")){
+      var v = results[String(items[i].no)];
+      return (v == null ? "" : String(v).trim());   // B列は読んだままの値
+    }
   }
   return "";
 }
@@ -5252,6 +6066,7 @@ async function run(){
   var btn = $("btnRun");
   btn.disabled = true;
   results = {}; labels = []; labelObs = []; assignMap = {}; usedTokens = 0; failedShots = 0; disagree = {}; snapped = {}; kcPicked = {}; doctorInfo = null; subVals = {};
+  icdPicked = {};
   currentRecordId = null;
   $("resultArea").innerHTML = '<div class="card prog"><span class="spin"></span> <span id="progMsg">準備中…</span></div>';
 
@@ -5296,6 +6111,7 @@ async function run(){
       });
       results = ex.results || {};
       curMaster = ex.master;
+      normalizeDurationFields();   // 手術時間・麻酔時間を 1:33 の形にそろえる
       disagree = ex.disagree || {};
       snapped = ex.snapped || {};
       doctorInfo = ex.doctorInfo || null;
@@ -5598,6 +6414,23 @@ function fieldRow(it, idx){
   if (it.suggest === "doctor"){
     ctrl += '<div style="margin-top:5px"><button class="btn mini" data-dc="' + esc(no) + '">\uD83D\uDC68‍⚕️ 医師マスタから選ぶ</button></div>';
   }
+  // 候補リストが未設定でも、病名・診断名の項目なら候補ボタンを出す
+  var wantIcd = (it.suggest === "icd10");
+  if (!wantIcd && !it.suggest && (it.type === "ocr" || it.type === "choice")){
+    var lb = String(it.label || "");
+    if (lb.indexOf("病名") >= 0 || lb.indexOf("診断名") >= 0) wantIcd = true;
+  }
+  if (wantIcd){
+    ctrl += '<div style="margin-top:5px"><button class="btn mini" data-ic="' + esc(no) + '">\uD83E\uDE7A 病名の候補を出す(AIが推定)</button></div>';
+  }
+  if (icdPicked[no]){
+    var ip = icdPicked[no];
+    ctrl += '<div class="matline" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
+              '<span>ICD-10 <b>' + esc(ip.icd10) + '</b></span>' +
+              '<button class="btn mini" data-cpi="' + esc(no) + '">\uD83D\uDCCB</button>' +
+              '<span style="margin-left:6px;color:#8a919c;font-size:12px">要確認</span>' +
+            '</div>';
+  }
   if (kcPicked[no]){
     var kp = kcPicked[no];
     ctrl += '<div class="matline" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">' +
@@ -5712,6 +6545,19 @@ function wireResults(){
     });
   }
 
+  var ics = area.querySelectorAll("button[data-ic]");
+  for (var y=0;y<ics.length;y++){
+    ics[y].addEventListener("click", function(ev){
+      openIcd(ev.currentTarget.getAttribute("data-ic"));
+    });
+  }
+  var cpis = area.querySelectorAll("button[data-cpi]");
+  for (var z=0;z<cpis.length;z++){
+    cpis[z].addEventListener("click", function(ev){
+      var n = ev.currentTarget.getAttribute("data-cpi");
+      if (icdPicked[n]) copyText(icdPicked[n].icd10);
+    });
+  }
   var kcs = area.querySelectorAll("button[data-kc]");
   for (var kk=0;kk<kcs.length;kk++){
     kcs[kk].addEventListener("click", function(ev){
@@ -5766,6 +6612,7 @@ var kcTargetNo = null;
 var docNames = [];      // 医師マスタ(フロントの選び直し用)
 var snapped = {};       // サーバー側で氏名を補正した記録
 var kcPicked = {};      // 選んだ登録術式 no -> {kcode,name,code}
+var icdPicked = {};     // 選んだ病名 no -> {name,icd10}
 var subVals = {};       // コンポーネントの入力欄 no -> [{catalog,maker,name,lot,sn,exp}, ...]
 var doctorInfo = null;  // 医師マスタの状態
 
@@ -5911,6 +6758,7 @@ function copyAll(){
 function resetAll(){
   if (!confirm("入力内容を破棄してやり直します。よろしい？")) return;
   results = {}; labels = []; labelObs = []; assignMap = {}; curMaster = null; disagree = {}; snapped = {}; kcPicked = {}; doctorInfo = null; subVals = {};
+  icdPicked = {};
   currentRecordId = null;
   pages = []; pdfDoc = null;
   $("pdfFile").value = "";
@@ -5956,6 +6804,11 @@ var AUTH_KEY = "opecopy_auth";
 // サイドバー(拡張のiframe)ではブラウザ設定によりlocalStorageが使えないことがある。
 // その場合でもタブを閉じるまでは動くよう、メモリ上にも控えを持つ。
 var memAuth = "";
+// ログインセッションの控え(Cookieが遮断される環境の保険)
+function getSessTok(){
+  try { return localStorage.getItem("ope_sess_tok") || ""; } catch(e){ return ""; }
+}
+
 function getToken(){
   try { var v = localStorage.getItem(AUTH_KEY); if (v) return v; } catch(e){}
   return memAuth;
@@ -6136,9 +6989,111 @@ async function ensureQrGate(){
 
 $("qrRenew").addEventListener("click", startQrGate);
 
+// ============================================================
+// 病名候補 (ICD-10)
+//   AIの知識だけで出しているので、コードの確認は利用者に委ねる
+// ============================================================
+var icTargetNo = null;
+
+function openIcd(no){
+  icTargetNo = no;
+  $("icQuery").value = results[no] == null ? "" : String(results[no]);
+  $("icList").innerHTML = "";
+  $("icModal").classList.remove("hidden");
+  runIcd();
+}
+
+async function runIcd(){
+  var q = $("icQuery").value.trim();
+  if (!q){ $("icList").innerHTML = '<div class="hint">病名を入れてね</div>'; return; }
+  $("icList").innerHTML = '<div class="hint"><span class="spin"></span> 検索中…</div>';
+  try {
+    var data = await api("/api/icd", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ query: q })
+    });
+    var rs = data.results || [];
+    if (!rs.length){ $("icList").innerHTML = '<div class="hint">候補が見つかりませんでした</div>'; return; }
+    var h = "";
+    for (var i=0;i<rs.length;i++){
+      h += '<div class="kcrow" data-pick="' + i + '">' +
+             '<div class="kcname">' + esc(rs[i].name) + '</div>' +
+             '<div class="kcmeta">ICD-10 ' + esc(rs[i].icd10) + (rs[i].kana ? '　' + esc(rs[i].kana) : '') + '</div>' +
+             (rs[i].reason ? '<div class="kcreason">' + esc(rs[i].reason) + '</div>' : '') +
+           '</div>';
+    }
+    $("icList").innerHTML = h;
+    var rows = $("icList").querySelectorAll(".kcrow");
+    for (var j=0;j<rows.length;j++){
+      rows[j].addEventListener("click", function(ev){
+        var idx = parseInt(ev.currentTarget.getAttribute("data-pick"),10);
+        var pick = rs[idx];
+        results[icTargetNo] = pick.name;
+        icdPicked[icTargetNo] = { name: pick.name, icd10: pick.icd10 };
+        $("icModal").classList.add("hidden");
+        renderResults();
+        toast("反映しました: " + pick.icd10);
+      });
+    }
+  } catch(e){
+    $("icList").innerHTML = '<div class="hint">検索に失敗: ' + esc(e.message) + '</div>';
+  }
+}
+
+// ============================================================
+// ログイン中の利用者 / ログアウト / 報告
+// ============================================================
+async function loadMe(){
+  try {
+    var r = await api("/api/whoami");
+    if (r.user) $("meBox").textContent = r.user + " でログイン中";
+  } catch(e){}
+}
+
+async function doLogout(){
+  if (!confirm("ログアウトします。よろしい？")) return;
+  try { await api("/api/logout", { method:"POST" }); } catch(e){}
+  try { localStorage.removeItem("ope_sess_tok"); } catch(e){}
+  location.href = "/login";
+}
+
+async function sendReport(){
+  var t = $("rpBody").value.trim();
+  if (!t){ alert("報告の内容を書いてください"); return; }
+  var b = $("rpSend");
+  b.disabled = true; b.textContent = "送信中…";
+  try {
+    await api("/api/report", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({
+        body: t,
+        master_id: curMaster ? (curMaster.id || "") : "",
+        master_name: curMaster ? (curMaster.name || "") : ""
+      })
+    });
+    toast("報告を送りました。ありがとう！");
+    $("rpBody").value = "";
+    $("rpModal").classList.add("hidden");
+  } catch(e){
+    alert("送信に失敗: " + e.message);
+  } finally {
+    b.disabled = false; b.textContent = "\uD83D\uDCE4 送る";
+  }
+}
+
 // 外周のBASIC認証を通った時点で利用資格は確認済みなので、
 // 表側でPW_OPEのログイン画面やQR承認は出さない
-function afterLogin(){ loadMasters(); }
+function afterLogin(){ loadMasters(); loadMe(); }
+
+$("btnLogout").addEventListener("click", function(ev){ ev.preventDefault(); doLogout(); });
+$("btnReport").addEventListener("click", function(ev){ ev.preventDefault(); $("rpModal").classList.remove("hidden"); });
+$("rpClose").addEventListener("click", function(){ $("rpModal").classList.add("hidden"); });
+$("rpSend").addEventListener("click", sendReport);
+$("icClose").addEventListener("click", function(){ $("icModal").classList.add("hidden"); });
+$("icRun").addEventListener("click", runIcd);
+$("icQuery").addEventListener("keydown", function(ev){ if (ev.key === "Enter") runIcd(); });
+$("icModal").addEventListener("click", function(ev){ if (ev.target === $("icModal")) $("icModal").classList.add("hidden"); });
+$("rpModal").addEventListener("click", function(ev){ if (ev.target === $("rpModal")) $("rpModal").classList.add("hidden"); });
 
 afterLogin();
 </script>
