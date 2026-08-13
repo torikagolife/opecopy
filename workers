@@ -93,7 +93,10 @@ export default {
       // ---------- 外周ゲート ----------
       // ① 許可IP以外は入口で遮断（ログイン画面すら見せない）
       if (!ipAllowed(request, env)) {
-        return new Response("Forbidden", { status: 403 });
+        return new Response(blockedHtml(clientIp(request)), {
+          status: 403,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        });
       }
       // ② ログイン確認。Cookie か Authorizationヘッダ(BASIC)で照合する
       //    ログイン処理そのものは通さないと入口が塞がるので先に通す
@@ -219,6 +222,9 @@ export default {
       }
       if (method === "GET" && path === "/api/record") {
         return await getRecord(env, url.searchParams.get("id"));
+      }
+      if (method === "GET" && path === "/api/record/find") {
+        return await findRecordByHash(env, url.searchParams.get("hash"));
       }
       if (method === "POST" && path === "/api/record/delete") {
         return await deleteRecord(env, await request.json());
@@ -396,8 +402,18 @@ function recNowIso() { return new Date().toISOString(); }
 async function saveRecord(env, body, authUser) {
   if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
   const b = body || {};
-  const id = b.id ? Number(b.id) : 0;
+  let id = b.id ? Number(b.id) : 0;
   const now = recNowIso();
+  const fileHash = String(b.file_hash || "").trim();
+
+  // 同じPDFを読み直した場合は、新しい行を作らず前の行を使い回す。
+  // (台帳の件数が増えないようにするため。通し番号と最初の読み取り日時も残る)
+  if (!id && fileHash) {
+    const prev = await env.opecopy_db.prepare(
+      "SELECT id FROM records WHERE file_hash=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1"
+    ).bind(fileHash).first();
+    if (prev && prev.id) id = Number(prev.id);
+  }
   const payload = typeof b.payload === "string" ? b.payload : JSON.stringify(b.payload || {});
   const by = String(authUser || b.by || "");   // BASIC認証のユーザー名を優先する
   const mId = b.master_id || null;
@@ -407,16 +423,30 @@ async function saveRecord(env, body, authUser) {
   const status = b.status || "draft";
 
   if (id) {
+    // 読み直しのときは、日時も登録者も「最後に読み込んだ人」に更新する
+    // (不明点を先輩に引き継いで処理してもらう運用があるため)
     await env.opecopy_db.prepare(
-      "UPDATE records SET updated_at=?, updated_by=?, master_id=?, master_name=?, patient_no=?, surgery_date=?, status=?, payload=? WHERE id=? AND deleted_at IS NULL"
-    ).bind(now, by, mId, mName, pNo, sDate, status, payload, id).run();
+      "UPDATE records SET updated_at=?, updated_by=?, created_by=CASE WHEN ?='' THEN created_by ELSE ? END, master_id=?, master_name=?, patient_no=?, surgery_date=?, status=?, payload=?, file_hash=COALESCE(NULLIF(?,''), file_hash) WHERE id=? AND deleted_at IS NULL"
+    ).bind(now, by, by, by, mId, mName, pNo, sDate, status, payload, fileHash, id).run();
     return jsonOk({ id: id, updated: true });
   }
   const res = await env.opecopy_db.prepare(
-    "INSERT INTO records (created_at, updated_at, created_by, updated_by, master_id, master_name, patient_no, surgery_date, status, payload) VALUES (?,?,?,?,?,?,?,?,?,?)"
-  ).bind(now, now, by, by, mId, mName, pNo, sDate, status, payload).run();
+    "INSERT INTO records (created_at, updated_at, created_by, updated_by, master_id, master_name, patient_no, surgery_date, status, payload, file_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+  ).bind(now, now, by, by, mId, mName, pNo, sDate, status, payload, fileHash || null).run();
   const newId = res && res.meta ? res.meta.last_row_id : null;
   return jsonOk({ id: newId, created: true });
+}
+
+// 読み込んだPDFが既に台帳にあるかを、AIに送る前に確かめる
+async function findRecordByHash(env, hash) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const h = String(hash || "").trim();
+  if (!h) return jsonOk({ found: false });
+  const row = await env.opecopy_db.prepare(
+    "SELECT id, created_at, updated_at, created_by, updated_by, master_name, patient_no, surgery_date FROM records WHERE file_hash=? AND deleted_at IS NULL ORDER BY id DESC LIMIT 1"
+  ).bind(h).first();
+  if (!row) return jsonOk({ found: false });
+  return jsonOk({ found: true, record: row });
 }
 
 async function getRecord(env, id) {
@@ -651,6 +681,11 @@ $("pw").focus();
 //   画面上のログインフォーム + Cookie でも入れるようにする。
 //   Authorizationヘッダ(BASIC)も従来どおり受け付ける。
 // ============================================================
+// 環境変数は貼り付け時に空白や改行が紛れ込みやすいので、読むときに落とす
+function envStr(env, key) {
+  return String((env && env[key]) || "").trim();
+}
+
 function sessSecret(env) {
   // 環境変数から鍵を作る。値そのものは外に出さない
   return "opecopy-session-v1|" + String((env && env.MASTER_PW) || "") + "|" + String((env && env.PW_OPE) || "");
@@ -704,10 +739,12 @@ function sessionCookie(value, maxAgeSec) {
 
 // IDとパスワードを名簿・非常口の順に照合する
 async function verifyCredential(env, id, pw) {
-  const uid = String(id || "");
+  const uid = String(id || "").trim();
   if (!uid) return false;
-  if (env && env.MASTER_ID && env.MASTER_PW && uid === String(env.MASTER_ID) && String(pw) === String(env.MASTER_PW)) {
-    return true;
+  const mid = envStr(env, "MASTER_ID");
+  const mpw = envStr(env, "MASTER_PW");
+  if (mid && mpw && uid === mid && String(pw).trim() === mpw) {
+    return true;   // 非常口(環境変数)での照合
   }
   const users = await loadUsers(env);
   for (const u of users) {
@@ -962,8 +999,27 @@ function ipMatches(ip, rule) {
   return ((base & mask) >>> 0) === ((target & mask) >>> 0);
 }
 
+// 接続を弾いたときの画面。設定時に原因が分かるよう、見えているIPだけ示す
+//   (表示するのは接続してきた本人のIPなので、他人の情報は出ない)
+function blockedHtml(ip) {
+  const safe = String(ip || "(取得できませんでした)").replace(/[<>&"]/g, "");
+  return '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1"><title>接続できません</title>' +
+    '<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;' +
+    'background:#f4f6f8;color:#1f2933;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;padding:20px}' +
+    '.c{background:#fff;border:1px solid #e3e6ea;border-radius:16px;padding:30px 26px;max-width:420px;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.06)}' +
+    'h1{font-size:19px;margin:10px 0 6px}p{font-size:13px;color:#6b7680;line-height:1.7;margin:6px 0}' +
+    'code{display:inline-block;background:#f0f3f5;border-radius:6px;padding:4px 10px;font-size:14px;color:#1f2933;margin-top:4px}</style>' +
+    '</head><body><div class="c"><div style="font-size:34px">\uD83D\uDEAB</div>' +
+    '<h1>院外からは利用できません</h1>' +
+    '<p>オペコピは院内のネットワークからのみ使えます。<br>院内のパソコンから開き直してください。</p>' +
+    '<p style="margin-top:16px">いま見えている接続元</p><code>' + safe + '</code>' +
+    '<p style="font-size:11.5px;margin-top:14px">院内から開いてもこの画面が出る場合は、この番号を管理者(DA課)へ伝えてください。</p>' +
+    '</div></body></html>';
+}
+
 function ipAllowed(request, env) {
-  const raw = String((env && env.ALLOW_IPS) || "").trim();
+  const raw = envStr(env, "ALLOW_IPS");
   if (!raw) return true;                   // 未設定なら制限しない
   const ip = clientIp(request);
   if (!ip) return false;
@@ -1015,14 +1071,14 @@ function decodeBasic(request) {
 
 async function basicGate(request, env) {
   const users = await loadUsers(env);
-  const hasMaster = !!(env && env.MASTER_ID && env.MASTER_PW);
+  const hasMaster = !!(envStr(env, "MASTER_ID") && envStr(env, "MASTER_PW"));
   // 名簿も非常口も無い＝まだ設定前。締め出さないよう素通しにする
   if (!users.length && !hasMaster) return { ok: true, user: "" };
 
   // ① ログインフォームで発行したCookie
   const sess = await readSession(request, env);
   if (sess) {
-    if (hasMaster && sess === String(env.MASTER_ID)) return { ok: true, user: sess };
+    if (hasMaster && sess === envStr(env, "MASTER_ID")) return { ok: true, user: sess };
     for (const u of users) if (u && u.id === sess) return { ok: true, user: sess };
     // 名簿から消された利用者のCookieは無効
   }
@@ -1031,8 +1087,8 @@ async function basicGate(request, env) {
   const cred = decodeBasic(request);
   if (!cred || !cred.id) return { ok: false, user: "" };
 
-  if (hasMaster && cred.id === String(env.MASTER_ID) && cred.pw === String(env.MASTER_PW)) {
-    return { ok: true, user: cred.id };
+  if (hasMaster && cred.id.trim() === envStr(env, "MASTER_ID") && cred.pw.trim() === envStr(env, "MASTER_PW")) {
+    return { ok: true, user: cred.id.trim() };
   }
   for (const u of users) {
     if (u && u.id === cred.id) {
@@ -1078,7 +1134,7 @@ async function apiSaveUser(env, body) {
   if (!/^[A-Za-z0-9._-]{2,32}$/.test(id)) {
     return jsonError("IDは半角英数字と . _ - のみ、2〜32文字にしてください", 400);
   }
-  if (env.MASTER_ID && id === String(env.MASTER_ID)) {
+  if (envStr(env, "MASTER_ID") && id === envStr(env, "MASTER_ID")) {
     return jsonError("このIDは使用できません", 400);
   }
   const users = await loadUsers(env);
@@ -1140,8 +1196,8 @@ async function checkAuth(request, env) {
 
 async function apiLogin(env, body) {
   if (!authRequired(env)) return jsonOk({ token: "", required: false });
-  const pw = String((body && body.password) || "");
-  if (!pw || pw !== String(env.PW_OPE)) return jsonError("パスワードが違います", 401);
+  const pw = String((body && body.password) || "").trim();
+  if (!pw || pw !== envStr(env, "PW_OPE")) return jsonError("パスワードが違います", 401);
   // ヘッダ用のトークンに加えて、/admin のページ自体を通すためのCookieも発行する
   const ck = await makeAdminCookie(env);
   return new Response(JSON.stringify({ ok: true, token: await authToken(env), required: true }), {
@@ -5318,6 +5374,7 @@ const FRONT_HTML = `<!DOCTYPE html>
     <div class="hint">
       各ページの役割を選んでね。<b>「送らない」にしたページはAIに送信されません</b>（個人情報の載る面を外せます）。
     </div>
+    <div id="dupNote" style="display:none;margin-top:8px;padding:9px 12px;border:1px solid #e8c98d;background:#fffaf2;border-radius:9px;font-size:12.5px;line-height:1.6"></div>
     <div class="thumbs" id="thumbs"></div>
   </div>
 
@@ -5425,6 +5482,7 @@ var curMaster = null;     // 抽出後に確定するマスタ本体
 var pages = [];           // {pdfPage|img, role:"rec"|"mat"|"skip", num}
 var pdfDoc = null;
 var currentRecordId = null;   // 保存中の台帳レコードid(新規読み取りで null に戻す)
+var currentFileHash = "";     // 読み込んだPDFの指紋。同じファイルなら台帳の同じ行を使い回す
 var results = {};         // no -> 値
 var labels = [];          // 確定した材料シール
 var labelObs = [];        // 各タイルからの生の観測(多数決の材料)
@@ -5798,16 +5856,25 @@ async function onFile(){
   if (!f) return;
   $("thumbs").innerHTML = '<div class="prog"><span class="spin"></span> 読込中…</div>';
   pages = []; pdfDoc = null;
+  currentFileHash = ""; currentRecordId = null;
+  var dn = document.getElementById("dupNote");
+  if (dn){ dn.style.display = "none"; dn.textContent = ""; }
   try {
     if (f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")){
       await ensurePdfJs();
       var buf = await f.arrayBuffer();
+      currentFileHash = await fileHashOf(buf);
+      await noticeSameFile();          // 前に読んだファイルなら知らせる
+      buf = await f.arrayBuffer();     // pdf.jsに渡す前に読み直す(getDocumentがbufを消費するため)
       pdfDoc = await window.pdfjsLib.getDocument({ data: buf }).promise;
       for (var i=1;i<=pdfDoc.numPages;i++){
         var pg = await pdfDoc.getPage(i);
         pages.push({ pdfPage: pg, num: i, role: (i === pdfDoc.numPages ? "mat" : "rec") });
       }
     } else {
+      var abuf = await f.arrayBuffer();
+      currentFileHash = await fileHashOf(abuf);
+      await noticeSameFile();
       var img = await loadImg(f);
       pages.push({ img: img, num: 1, role: "rec" });
     }
@@ -5816,6 +5883,48 @@ async function onFile(){
     $("thumbs").innerHTML = '<div class="prog">読込失敗: ' + esc(e.message) + '</div>';
   }
   updateRunBtn();
+}
+
+// ファイルの中身から指紋を作る。中身が1バイトでも違えば別の値になる。
+// ブラウザの中だけで計算していて、ファイル名も中身も外には送らない。
+async function fileHashOf(buf){
+  try {
+    var digest = await crypto.subtle.digest("SHA-256", buf);
+    var arr = Array.prototype.slice.call(new Uint8Array(digest));
+    var hex = "";
+    for (var i=0;i<arr.length;i++){ hex += ("0" + arr[i].toString(16)).slice(-2); }
+    return hex;
+  } catch(e){
+    return "";   // 使えない環境では指紋なしで動く(今までどおり毎回新規になる)
+  }
+}
+
+// 同じファイルを前に読んでいたら、その症例に上書きすることを伝える
+async function noticeSameFile(){
+  if (!currentFileHash) return;
+  try {
+    var r = await api("/api/record/find?hash=" + encodeURIComponent(currentFileHash));
+    if (!r || !r.found || !r.record) return;
+    currentRecordId = r.record.id;     // 同じ行に上書きする
+    var who = r.record.updated_by || r.record.created_by || "";
+    var msg = "\uD83D\uDCD2 このファイルは読み取り済みです（症例 #" + r.record.id + "・" +
+              recFmtJst(r.record.updated_at || r.record.created_at) +
+              (who ? "・" + who : "") + "）。読み取ると同じ症例が新しい内容に置き換わります。台帳の件数は増えません。";
+    var box = document.getElementById("dupNote");
+    if (box){ box.textContent = msg; box.style.display = "block"; }
+  } catch(e){
+    // 照会に失敗しても読み取りは続けられる
+  }
+}
+
+// UTCで持っている日時を日本時間で表示する
+function recFmtJst(iso){
+  if (!iso) return "";
+  var dt = new Date(iso);
+  if (isNaN(dt.getTime())) return String(iso);
+  function z(n){ return (n<10?"0":"") + n; }
+  return dt.getFullYear() + "/" + z(dt.getMonth()+1) + "/" + z(dt.getDate()) +
+         " " + z(dt.getHours()) + ":" + z(dt.getMinutes());
 }
 
 function loadImg(file){
@@ -6034,6 +6143,7 @@ async function doSaveRecord(){
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
         id: currentRecordId,
+        file_hash: currentFileHash,
         master_id: (curMaster.id || ""),
         master_name: (curMaster.name || ""),
         patient_no: pickPatientNo(),
@@ -6068,6 +6178,7 @@ async function run(){
   results = {}; labels = []; labelObs = []; assignMap = {}; usedTokens = 0; failedShots = 0; disagree = {}; snapped = {}; kcPicked = {}; doctorInfo = null; subVals = {};
   icdPicked = {};
   currentRecordId = null;
+  currentFileHash = "";
   $("resultArea").innerHTML = '<div class="card prog"><span class="spin"></span> <span id="progMsg">準備中…</span></div>';
 
   try {
@@ -6760,6 +6871,7 @@ function resetAll(){
   results = {}; labels = []; labelObs = []; assignMap = {}; curMaster = null; disagree = {}; snapped = {}; kcPicked = {}; doctorInfo = null; subVals = {};
   icdPicked = {};
   currentRecordId = null;
+  currentFileHash = "";
   pages = []; pdfDoc = null;
   $("pdfFile").value = "";
   $("thumbs").innerHTML = "";
