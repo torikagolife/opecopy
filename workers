@@ -93,9 +93,10 @@ export default {
       // ---------- 外周ゲート ----------
       // ① 許可IP以外は入口で遮断（ログイン画面すら見せない）
       if (!ipAllowed(request, env)) {
-        return new Response(blockedHtml(clientIp(request)), {
+        // 詳細は出さない(許可条件を推測させないため)
+        return new Response("接続が許可されていません", {
           status: 403,
-          headers: { "content-type": "text/html; charset=utf-8" },
+          headers: { "content-type": "text/plain; charset=utf-8" },
         });
       }
       // ② ログイン確認。Cookie か Authorizationヘッダ(BASIC)で照合する
@@ -130,7 +131,7 @@ export default {
 
       // ---------- 画面 ----------
       if (method === "GET" && (path === "/" || path === "")) {
-        return new Response(FRONT_HTML, {
+        return new Response(applyHelpLink(FRONT_HTML, envStr(env, "HELP_USERS")), {
           headers: { "content-type": "text/html; charset=utf-8" },
         });
       }
@@ -142,7 +143,7 @@ export default {
             headers: { "content-type": "text/html; charset=utf-8" },
           });
         }
-        return new Response(ADMIN_HTML, {
+        return new Response(applyHelpLink(ADMIN_HTML, envStr(env, "HELP_ADMIN")), {
           headers: { "content-type": "text/html; charset=utf-8" },
         });
       }
@@ -681,6 +682,14 @@ $("pw").focus();
 //   画面上のログインフォーム + Cookie でも入れるようにする。
 //   Authorizationヘッダ(BASIC)も従来どおり受け付ける。
 // ============================================================
+// ヘルプのリンク先(環境変数)を画面に差し込む。
+//   未設定ならヘルプのリンクごと消すので、設定前でも画面が崩れない。
+function applyHelpLink(html, url) {
+  const u = String(url || "").trim();
+  if (!u) return html.replace(/<a href="__HELP_URL__"[\s\S]*?<\/a>\s*/, "");
+  return html.replace("__HELP_URL__", u.replace(/"/g, "%22"));
+}
+
 // 環境変数は貼り付け時に空白や改行が紛れ込みやすいので、読むときに落とす
 function envStr(env, key) {
   return String((env && env[key]) || "").trim();
@@ -997,25 +1006,6 @@ function ipMatches(ip, rule) {
   if (bits === 0) return true;
   const mask = bits === 32 ? 0xFFFFFFFF : ~((1 << (32 - bits)) - 1) >>> 0;
   return ((base & mask) >>> 0) === ((target & mask) >>> 0);
-}
-
-// 接続を弾いたときの画面。設定時に原因が分かるよう、見えているIPだけ示す
-//   (表示するのは接続してきた本人のIPなので、他人の情報は出ない)
-function blockedHtml(ip) {
-  const safe = String(ip || "(取得できませんでした)").replace(/[<>&"]/g, "");
-  return '<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1"><title>接続できません</title>' +
-    '<style>body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;' +
-    'background:#f4f6f8;color:#1f2933;font-family:-apple-system,BlinkMacSystemFont,"Hiragino Kaku Gothic ProN","Yu Gothic",sans-serif;padding:20px}' +
-    '.c{background:#fff;border:1px solid #e3e6ea;border-radius:16px;padding:30px 26px;max-width:420px;text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.06)}' +
-    'h1{font-size:19px;margin:10px 0 6px}p{font-size:13px;color:#6b7680;line-height:1.7;margin:6px 0}' +
-    'code{display:inline-block;background:#f0f3f5;border-radius:6px;padding:4px 10px;font-size:14px;color:#1f2933;margin-top:4px}</style>' +
-    '</head><body><div class="c"><div style="font-size:34px">\uD83D\uDEAB</div>' +
-    '<h1>院外からは利用できません</h1>' +
-    '<p>オペコピは院内のネットワークからのみ使えます。<br>院内のパソコンから開き直してください。</p>' +
-    '<p style="margin-top:16px">いま見えている接続元</p><code>' + safe + '</code>' +
-    '<p style="font-size:11.5px;margin-top:14px">院内から開いてもこの画面が出る場合は、この番号を管理者(DA課)へ伝えてください。</p>' +
-    '</div></body></html>';
 }
 
 function ipAllowed(request, env) {
@@ -3120,6 +3110,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
     <h1>\uD83D\uDCCB オペコピ</h1>
     <small>管理画面</small>
     <span id="meBox" style="margin-left:auto;font-size:12.5px;color:#8a919c;align-self:center"></span>
+    <a href="__HELP_URL__" id="btnHelp" target="_blank" rel="noopener">\uD83D\uDCD8 管理画面ヘルプ</a>
     <a href="/">\uD83D\uDCCB オペコピに戻る</a>
     <a href="#" id="btnLogout">\uD83D\uDEAA ログアウト</a>
   </div>
@@ -5355,6 +5346,7 @@ const FRONT_HTML = `<!DOCTYPE html>
     <h1>\uD83D\uDCCB オペコピ</h1>
     <small>手術記録用紙 → JOANR入力補助</small>
     <span id="meBox" style="margin-left:auto;font-size:12.5px;color:#8a919c;align-self:center"></span>
+    <a href="__HELP_URL__" id="btnHelp" target="_blank" rel="noopener">\u2753 ヘルプ</a>
     <a href="#" id="btnReport">\uD83D\uDCE3 報告</a>
     <a href="/admin">⚙️ 管理画面</a>
     <a href="#" id="btnLogout">\uD83D\uDEAA ログアウト</a>
