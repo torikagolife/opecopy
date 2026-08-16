@@ -53,6 +53,10 @@ const DOCTORS_KEY = "staff:doctors";
 const USERS_KEY = "auth:users";   // BASIC認証の利用者名簿(KV)
 const KCODE_KEY = "kcode:list";   // 術式マスタ(Kコード)。KVが空ならコード内の初期値を使う
 const MAILTPL_KEY = "mail:templates";   // 管理者用の定型文(3件)
+const CHIBA_KEYS = {                    // 千葉大フォーム用の選択肢リスト
+  byomei: "chiba:byomei",
+  jutsushiki: "chiba:jutsushiki",
+};
 const SESS_COOKIE = "ope_sess";         // ログインセッションのCookie名
 const ADMIN_COOKIE = "ope_admin";       // 管理画面(PW_OPE)を通った証のCookie名
 const ADMIN_HOURS = 12;                 // 管理画面セッションの有効時間
@@ -233,6 +237,21 @@ export default {
       if (method === "GET" && path === "/api/records") {
         return await listRecords(env, url.searchParams);
       }
+      if (method === "GET" && path === "/api/chiba/work") {
+        return await listChibaWork(env, url.searchParams);
+      }
+      if (method === "POST" && path === "/api/chiba/done") {
+        return await markChibaDone(env, await request.json());
+      }
+      if (method === "GET" && path === "/api/chiba") {
+        return await apiGetChiba(env, url.searchParams.get("kind") || "");
+      }
+      if (method === "POST" && path === "/api/chiba") {
+        return await apiSaveChiba(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/chiba/match") {
+        return await apiChibaMatch(env, await request.json());
+      }
       if (method === "POST" && path === "/api/icd") {
         return await apiIcd(env, await request.json());
       }
@@ -345,7 +364,8 @@ async function saveMaster(env, body) {
       if (kw) it.keyword = kw;
       if (rl) it.rule = rl;
       const sg = String(src.suggest || "").trim();
-      if (sg === "kcode" || sg === "doctor" || sg === "icd10") it.suggest = sg;   // 候補リストを出す項目
+      if (sg === "kcode" || sg === "doctor" || sg === "icd10" ||
+          sg === "chiba-byomei" || sg === "chiba-jutsushiki") it.suggest = sg;   // 候補リストを出す項目
     }
     if (type === "sticker") {
       it.source = "label";
@@ -1094,6 +1114,8 @@ async function basicGate(request, env) {
 function isAdminApi(method, path) {
   if (path === "/api/users" || path === "/api/users/delete") return true;
   if (path === "/api/kcodes") return true;
+  if (path === "/api/chiba") return true;   // 一致検索(/api/chiba/match)は利用者も使う
+  if (path === "/api/chiba/work" || path === "/api/chiba/done") return true;
   if (path === "/api/reports") return true;
   if (path === "/api/report/read" || path === "/api/report/delete") return true;
   if (path === "/api/mailtpl") return true;
@@ -1536,8 +1558,32 @@ async function apiExtract(env, body) {
     if (it.type === "fixed") results[String(it.no)] = it.value || "";
   }
 
+  // 千葉大セクションのうち、JOANR項目と中身が同じものはAIに聞かず後で写す
+  //   (同じ用紙を2回読んで値が食い違う事故を防ぎ、そのぶん費用も減らす)
+  const copyPairs = [];          // { toNo, fromNo }
+  const copySkip = new Set();    // AIに投げない項目のno
+  {
+    const srcByLabel = new Map();
+    for (const it of master.items) {
+      if (isChibaSection(it.section)) continue;      // 写し元はJOANR側から探す
+      const lb = String(it.label || "").trim();
+      if (lb && !srcByLabel.has(lb)) srcByLabel.set(lb, it);
+    }
+    for (const it of master.items) {
+      if (!isChibaSection(it.section)) continue;
+      if (it.type !== "ocr" && it.type !== "choice") continue;
+      const lb = String(it.label || "").trim();
+      const src = srcByLabel.get(lb) || srcByLabel.get("患者" + lb);
+      if (!src) continue;
+      copyPairs.push({ toNo: String(it.no), fromNo: String(src.no) });
+      copySkip.add(String(it.no));
+    }
+  }
+
   // OCR対象(ocr / choice)だけをAIに投げる
-  const targets = master.items.filter((it) => it.type === "ocr" || it.type === "choice");
+  const targets = master.items.filter(
+    (it) => (it.type === "ocr" || it.type === "choice") && !copySkip.has(String(it.no))
+  );
 
   // 記録面を {num, image} に正規化(文字列だけの旧形式も受ける)
   const pageList = [];
@@ -1629,6 +1675,13 @@ async function apiExtract(env, body) {
       results[key] = v;
       if (disagree[key]) disagreeOut[key] = disagree[key];
     }
+  }
+
+  // JOANR項目から千葉大項目へ写す(AIに聞かずに同じ値をそのまま使う)
+  for (const pair of copyPairs) {
+    const v = results[pair.fromNo];
+    if (v == null || v === "") continue;
+    results[pair.toNo] = v;
   }
 
   return jsonOk({
@@ -2729,6 +2782,319 @@ const KCODE_SCHEMA = {
   },
 };
 
+// ============================================================
+// 千葉大フォームの入力待ち一覧
+//   脊椎などの用紙には千葉大用の項目が入っているが、
+//   入力できるのはアカウントを持つ担当者だけなので、
+//   読み取りとは切り離して「あとでまとめて入力する」ための画面を用意する。
+// ============================================================
+
+// 千葉大の項目を持つ用紙のIDを集める
+async function chibaMasterIds(env) {
+  const ids = [];
+  try {
+    const list = await loadMasters(env);
+    for (const m of list) {
+      const items = (m && m.items) || [];
+      for (const it of items) {
+        if (isChibaSection(it.section)) { ids.push(m.id); break; }
+      }
+    }
+  } catch (e) {}
+  return ids;
+}
+
+// payloadから千葉大セクションの項目だけ取り出す
+function pickChibaFields(payload) {
+  let p = {};
+  try { p = JSON.parse(payload || "{}"); } catch (e) { return []; }
+  const out = [];
+  for (const f of (p.fields || [])) {
+    if (!isChibaSection(f.section)) continue;
+    out.push({ no: f.no, label: f.label, value: f.value == null ? "" : String(f.value) });
+  }
+  return out;
+}
+
+async function listChibaWork(env, params) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const p = params || new URLSearchParams();
+  const done = (p.get("done") || "") === "1";
+  const ids = await chibaMasterIds(env);
+  if (!ids.length) return jsonOk({ records: [], count: 0, note: "千葉大用の項目を持つ用紙がありません" });
+
+  const holes = ids.map(() => "?").join(",");
+  const where = ["deleted_at IS NULL", "master_id IN (" + holes + ")"];
+  const args = ids.slice();
+  where.push(done ? "chiba_at IS NOT NULL" : "chiba_at IS NULL");
+  const from = (p.get("from") || "").trim();
+  const to = (p.get("to") || "").trim();
+  if (from) { where.push("surgery_date >= ?"); args.push(from); }
+  if (to) { where.push("surgery_date <= ?"); args.push(to); }
+  let limit = parseInt(p.get("limit") || "50", 10);
+  if (!(limit > 0) || limit > 200) limit = 50;
+
+  const sql =
+    "SELECT id, patient_no, surgery_date, master_name, updated_by, updated_at, chiba_at, payload " +
+    "FROM records WHERE " + where.join(" AND ") +
+    " ORDER BY surgery_date ASC, id ASC LIMIT ?";
+  const rs = await env.opecopy_db.prepare(sql).bind(...args, limit).all();
+
+  // payloadは重いので、千葉大の項目だけに絞って返す
+  const records = [];
+  for (const r of (rs && rs.results) || []) {
+    records.push({
+      id: r.id, patient_no: r.patient_no, surgery_date: r.surgery_date,
+      master_name: r.master_name, updated_by: r.updated_by, updated_at: r.updated_at,
+      chiba_at: r.chiba_at, fields: pickChibaFields(r.payload),
+    });
+  }
+  return jsonOk({ records: records, count: records.length, done: done });
+}
+
+async function markChibaDone(env, body) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const b = body || {};
+  const id = Number(b.id || 0);
+  if (!id) return jsonError("idが不正です", 400);
+  const val = b.done === false ? null : new Date().toISOString();
+  await env.opecopy_db.prepare(
+    "UPDATE records SET chiba_at=? WHERE id=? AND deleted_at IS NULL"
+  ).bind(val, id).run();
+  return jsonOk({ id: id, done: !!val });
+}
+
+// ============================================================
+// 千葉大フォーム用のリスト (病名 / 術式)
+//   脊椎はJOANRに加えて千葉大のフォームにも登録するため、
+//   そちらで選べる語だけを並べたリストを持っている。
+//   件数が少ない(数十件)ので、候補を出すときはリストごとAIに渡し、
+//   返ってきた名前をリストと突き合わせて存在しないものを捨てる。
+//   → 術式マスタ(Kコード)と同じ「幻覚を出さない」作りにしている。
+// ============================================================
+const CHIBA_BYOMEI_DEFAULT = [
+  "頚椎椎間板ヘルニア",
+  "OPLL",
+  "OYL",
+  "OSM(頚椎症性脊髄症)",
+  "他の脊髄症(SCS)",
+  "頚椎症性神経根症",
+  "頚椎症性筋委縮症",
+  "リウマチ頚椎(AAS、VS、SAS)",
+  "脳性麻痺による頚髄症",
+  "パーキンソンによる頚髄症",
+  "透析性脊椎症",
+  "強直性脊椎骨増殖症(ASH)",
+  "後頭環椎間不安定症、環軸椎間不安定症、Os odontiodeum、Chiari奇形等",
+  "化膿性脊椎炎(カリエス、硬膜外腫瘍)",
+  "硬膜外血腫",
+  "胸椎椎間板ヘルニア",
+  "脊椎症性胸髄症",
+  "他の胸髄症(SCS)",
+  "RAによる胸椎疾患",
+  "脳性麻痺による胸椎疾患",
+  "パーキンソンによる胸椎疾患",
+  "腫瘍",
+  "脊椎転移",
+  "外傷",
+  "感染",
+  "腰椎椎間板ヘルニア(脊柱管内、硬膜外含む）",
+  "腰椎椎間板ヘルニア(外側型)",
+  "椎間板症(椎間板性腰痛)",
+  "椎間分離症",
+  "腰部脊柱管狭窄症",
+  "腰椎すべり症(椎間孔狭窄含む)",
+  "腰椎変性側弯症",
+  "思春期特発性側弯症",
+  "その他",
+];
+
+const CHIBA_JUTSU_DEFAULT = [
+  "腰椎前方(除圧)固定術",
+  "腰椎後方固定術(除圧なし、骨移植なし、または後方移植)",
+  "腰椎後方除圧(開窓、椎弓切除)",
+  "PLF",
+  "TLIF",
+  "PLIF",
+  "椎間板ヘルニア摘出(OPEN)",
+  "椎間板ヘルニア摘出(内視鏡)",
+  "椎弓切除(内視鏡)",
+  "椎間板ヘルニア摘出(顕微鏡)",
+  "椎弓切除(顕微鏡)",
+  "腰椎分離修復術",
+  "腰椎前後合併(除圧)固定術",
+  "OLIF",
+  "XLIF",
+  "腰椎椎体形成術",
+  "腰椎短縮術",
+  "インプラント抜去",
+  "椎間板内酵素注入療法(ヘルコニア注入)",
+  "脊髄刺激療法(SCS)",
+  "頚椎前方(除圧)固定術",
+  "頚椎椎弓形成術、椎弓切除",
+  "頚椎後方(除圧)固定術",
+  "頚椎前後合併(除圧)固定術",
+  "胸椎前方(除圧)固定術",
+  "胸椎椎弓切除",
+  "胸椎後方(除圧)固定術",
+  "胸椎椎体形成術",
+  "胸椎短縮術",
+  "その他",
+];
+
+// セクション名に「千葉大」が入っていれば千葉大フォーム用の項目とみなす
+function isChibaSection(sec) {
+  return String(sec || "").indexOf("千葉大") >= 0;
+}
+
+function chibaDefault(kind) {
+  return kind === "jutsushiki" ? CHIBA_JUTSU_DEFAULT : CHIBA_BYOMEI_DEFAULT;
+}
+
+function chibaKindOk(kind) {
+  return kind === "byomei" || kind === "jutsushiki";
+}
+
+function chibaLabel(kind) {
+  return kind === "jutsushiki" ? "術式" : "病名";
+}
+
+// KVに登録があればそれを、無ければコード内蔵の初期値を使う
+async function getChibaList(env, kind) {
+  if (env && env.FORM_KV) {
+    try {
+      const raw = await env.FORM_KV.get(CHIBA_KEYS[kind], { cacheTtl: 300 });
+      if (raw) {
+        const obj = JSON.parse(raw);
+        const rows = Array.isArray(obj.rows) ? obj.rows : null;
+        if (rows && rows.length) return rows;
+      }
+    } catch (e) {
+      // 壊れていたら初期値に落とす
+    }
+  }
+  return chibaDefault(kind);
+}
+
+// Excelから来た行を整える。空行を捨て、同じ名前は1つにまとめる
+function normalizeChibaRows(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const r of rows || []) {
+    const cell = Array.isArray(r) ? r[0] : r;
+    const v = (cell == null) ? "" : String(cell).trim();
+    if (!v) continue;
+    if (seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+  }
+  return out;
+}
+
+async function apiGetChiba(env, kind) {
+  if (!chibaKindOk(kind)) return jsonError("種別が不正です", 400);
+  const rows = await getChibaList(env, kind);
+  let stored = false;
+  if (env && env.FORM_KV) {
+    try { stored = !!(await env.FORM_KV.get(CHIBA_KEYS[kind])); } catch (e) {}
+  }
+  return jsonOk({
+    kind: kind, rows: rows, count: rows.length,
+    stored: stored, builtinCount: chibaDefault(kind).length,
+  });
+}
+
+async function apiSaveChiba(env, body) {
+  if (!env.FORM_KV) return jsonError("KVバインディング FORM_KV が設定されていません", 500);
+  const b = body || {};
+  const kind = String(b.kind || "");
+  if (!chibaKindOk(kind)) return jsonError("種別が不正です", 400);
+  if (b.reset) {
+    await env.FORM_KV.delete(CHIBA_KEYS[kind]);
+    return jsonOk({ reset: true, count: chibaDefault(kind).length });
+  }
+  const rows = normalizeChibaRows(b.rows);
+  if (!rows.length) return jsonError("取り込める行がありません", 400);
+  await env.FORM_KV.put(CHIBA_KEYS[kind], JSON.stringify({ rows: rows, updatedAt: new Date().toISOString() }));
+  return jsonOk({ saved: true, count: rows.length });
+}
+
+const CHIBA_SCHEMA = {
+  name: "chiba_candidates",
+  strict: true,
+  schema: {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      results: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            name: { type: "string" },
+            reason: { type: "string" },
+          },
+          required: ["name", "reason"],
+        },
+      },
+    },
+    required: ["results"],
+  },
+};
+
+async function apiChibaMatch(env, body) {
+  const b = body || {};
+  const kind = String(b.kind || "");
+  if (!chibaKindOk(kind)) return jsonError("種別が不正です", 400);
+  const query = String(b.query || "").trim();
+  if (!query) return jsonError(chibaLabel(kind) + "を入力してください", 400);
+  if (query.length > 200) return jsonError("入力が長すぎます(200文字まで)", 400);
+  if (!env.OPENAI_API_KEY) return jsonError("OPENAI_API_KEY が設定されていません", 500);
+
+  const rows = await getChibaList(env, kind);
+  const listText = rows.map((r, i) => (i + 1) + ". " + r).join("\n");
+
+  const systemPrompt =
+    "あなたは脊椎外科の症例登録に精通した診療情報管理士です。" +
+    "手術記録に書かれた" + chibaLabel(kind) + "の表現(略語・英語・表記ゆれ・部位付きの記載を含む)に対し、" +
+    "提供された登録リストの中から意味的に近いものを、近い順に最大4件選びます。" +
+    "リストに無い語は絶対に返さないでください。リストの表記をそのまま返してください。" +
+    "近いものが1件しかなければ1件だけ返して構いません。" +
+    "reasonは選定理由を15文字以内で簡潔に。";
+
+  const userPrompt =
+    "# 手術記録の記載\n" + query + "\n\n" +
+    "# 登録リスト\n" + listText;
+
+  const out = await callOpenAI(
+    env, MODEL_KCODE,
+    [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+    600, CHIBA_SCHEMA
+  );
+
+  // リストに実在する名前だけを残す(幻覚と表記ゆれの防止)
+  const valid = new Map();
+  for (const r of rows) valid.set(r, true);
+  const results = [];
+  const used = new Set();
+  const raw = (out.json && out.json.results) || [];
+  for (const r of raw) {
+    const nm = String(r.name || "").trim();
+    if (!valid.has(nm) || used.has(nm)) continue;
+    used.add(nm);
+    results.push({ name: nm, reason: String(r.reason || "") });
+    if (results.length >= 4) break;
+  }
+  if (!results.length) {
+    return jsonError("該当する" + chibaLabel(kind) + "が見つかりませんでした。表現を変えて検索してください", 200);
+  }
+  return jsonOk({ results: results, usage: out.usage || null });
+}
+
 async function apiKcode(env, body) {
   const query = String((body && body.query) || "").trim();
   if (!query) return jsonError("術式名を入力してください", 400);
@@ -3122,6 +3488,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       <button class="btn" id="btnDoc">\uD83D\uDC68‍⚕️ 医師マスタ</button>
       <button class="btn" id="btnRec">\uD83D\uDCD2 症例台帳</button>
       <button class="btn" id="btnKc">\uD83E\uDE7A 術式マスタ</button>
+      <button class="btn" id="btnChiba">\uD83C\uDFEB 千葉大リスト</button>
       <button class="btn" id="btnUsers">\uD83D\uDD11 利用者管理</button>
       <button class="btn" id="btnHomeReload">\uD83D\uDD04 再読込</button>
     </div>
@@ -3196,6 +3563,35 @@ const ADMIN_HTML = `<!DOCTYPE html>
   </div>
 </div>
 
+<!-- ============ 千葉大リスト ============ -->
+<div class="overlay hidden" id="chModal">
+  <div class="modal">
+    <div class="mhead">\uD83C\uDFEB 千葉大リスト<small style="display:block;font-weight:400;color:#8a919c;font-size:12px;margin-top:3px">脊椎で千葉大のフォームに登録するときに選べる語の一覧です</small></div>
+    <div class="mbody">
+      <div class="bar">
+        <button class="btn primary" id="chTabB">\uD83E\uDE7A 病名</button>
+        <button class="btn" id="chTabJ">\uD83D\uDD2A 術式</button>
+      </div>
+      <div id="chStat" class="empty" style="margin-top:10px">読込中…</div>
+      <div class="bar" style="margin-top:12px">
+        <input type="file" id="chFile" accept=".xlsx,.xlsm,.xls,.csv" style="display:none">
+        <button class="btn" id="chExport">\uD83D\uDCE4 Excel書き出し</button>
+        <button class="btn teal" id="chImport">\uD83D\uDCE5 Excelから取込</button>
+        <button class="btn danger" id="chReset">初期値に戻す</button>
+      </div>
+      <div class="hint" style="margin-top:10px">
+        Excelは<b>A列に1行1語</b>だけを入れてください。見出し行があれば取込時に読み飛ばします。<br>
+        取込は<b>全置換</b>です。同じ語が複数あるときは1つにまとめます。
+      </div>
+      <div id="chPreview" class="hidden" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px"></div>
+      <div id="chList" style="margin-top:12px"></div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="chClose">閉じる</button>
+    </div>
+  </div>
+</div>
+
 <!-- ============ 術式マスタ(Kコード) ============ -->
 <div class="overlay hidden" id="kcModal">
   <div class="modal">
@@ -3249,6 +3645,11 @@ const ADMIN_HTML = `<!DOCTYPE html>
   <div class="modal" style="max-width:1000px">
     <div class="mhead">\uD83D\uDCD2 症例台帳<small style="display:block;font-weight:400;color:#8a919c;font-size:12px;margin-top:3px">読み取った症例の保存記録。行をクリックすると中身を表示します</small></div>
     <div class="mbody">
+      <div class="bar" style="margin-bottom:10px">
+        <button class="btn primary" id="recTabAll">\uD83D\uDCD2 すべての症例</button>
+        <button class="btn" id="recTabChiba">\uD83C\uDFEB 千葉大フォーム入力</button>
+      </div>
+      <div id="recPaneAll">
       <div class="bar" style="flex-wrap:wrap;gap:6px">
         <input type="text" id="recQPatient" placeholder="患者ID" style="width:120px;padding:6px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px">
         <select id="recQMaster" style="padding:6px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px"><option value="">用紙：すべて</option></select>
@@ -3262,6 +3663,23 @@ const ADMIN_HTML = `<!DOCTYPE html>
       </div>
       <div id="recBody"><div class="empty">読込中…</div></div>
       <div id="recDetail" class="hidden" style="margin-top:14px;border-top:1px solid var(--line);padding-top:12px"></div>
+      </div><!-- /recPaneAll -->
+
+      <div id="recPaneChiba" class="hidden">
+        <div class="bar" style="flex-wrap:wrap;gap:6px">
+          <button class="btn primary" id="cwTodo">未入力</button>
+          <button class="btn" id="cwDone">入力済み</button>
+          <input type="date" id="cwFrom" style="padding:6px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px">
+          <span style="align-self:center;color:#8a919c;font-size:13px">〜</span>
+          <input type="date" id="cwTo" style="padding:6px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px">
+          <button class="btn" id="cwSearch">\uD83D\uDD0D 絞り込む</button>
+          <span class="hint" id="cwCount" style="margin-left:auto;align-self:center"></span>
+        </div>
+        <div class="hint" style="margin-top:6px">
+          千葉大のフォームに登録する症例です。上から順に入力して、終わったら「入力済み」を押してください。
+        </div>
+        <div id="cwBody" style="margin-top:10px"><div class="empty">読込中…</div></div>
+      </div>
     </div>
     <div class="mfoot">
       <button class="btn" id="recMore">さらに読み込む</button>
@@ -3657,6 +4075,8 @@ function itemCard(it, idx, total){
       '<option value=""' + (it.suggest ? "" : " selected") + '>なし</option>' +
       '<option value="kcode"' + (it.suggest === "kcode" ? " selected" : "") + '>\uD83D\uDD0D 登録術式(Kコード)</option>' +
       '<option value="icd10"' + (it.suggest === "icd10" ? " selected" : "") + '>\uD83E\uDE7A 病名(ICD-10・AI推定)</option>' +
+      '<option value="chiba-byomei"' + (it.suggest === "chiba-byomei" ? " selected" : "") + '>\uD83C\uDFEB 千葉大リスト(病名)</option>' +
+      '<option value="chiba-jutsushiki"' + (it.suggest === "chiba-jutsushiki" ? " selected" : "") + '>\uD83C\uDFEB 千葉大リスト(術式)</option>' +
       '<option value="doctor"' + (it.suggest === "doctor" ? " selected" : "") + '>\uD83D\uDC68‍⚕️ 医師マスタ</option>' +
       '</select></div>';
   }
@@ -3912,9 +4332,20 @@ function looksLikeHeader(r){
          j.indexOf("読取り") >= 0 || j.indexOf("出力対象") >= 0;
 }
 
+// 【…】で終わる行はセクション見出しとみなす。
+// 「★【千葉大用】」のように前に飾りが付いていても拾えるようにしている。
 function isSectionLabel(lab){
   var s = String(lab||"").trim();
-  return s.length >= 3 && s.charAt(0) === "【" && s.charAt(s.length-1) === "】";
+  var a = s.indexOf("【");
+  var b = s.lastIndexOf("】");
+  return a >= 0 && b === s.length - 1 && b > a + 1;
+}
+
+function sectionNameOf(lab){
+  var s = String(lab||"").trim();
+  var a = s.indexOf("【");
+  var b = s.lastIndexOf("】");
+  return s.slice(a + 1, b);
 }
 
 // 1シート → items配列
@@ -3933,7 +4364,7 @@ function sheetToItems(rows){
     var mkw  = String(row[7]==null?"":row[7]).trim();   // H列: 材料キーワード
     var nkw  = String(row[8]==null?"":row[8]).trim();   // I列: 除外キーワード
     if (!lab) continue;
-    if (isSectionLabel(lab)){ section = lab.slice(1, lab.length-1); continue; }
+    if (isSectionLabel(lab)){ section = sectionNameOf(lab); continue; }
 
     var type = classifyRow(out, kw, rule);
     var it = { no: items.length+1, section: section, label: lab, type: type };
@@ -3949,6 +4380,8 @@ function sheetToItems(rows){
       if (rule) it.rule = rule;
       if (sug === "kcode") it.suggest = "kcode";
       else if (sug === "icd10") it.suggest = "icd10";
+      else if (sug === "chiba-byomei") it.suggest = "chiba-byomei";
+      else if (sug === "chiba-jutsushiki") it.suggest = "chiba-jutsushiki";
     }
     if (type === "sticker"){
       it.source = "label";
@@ -4509,6 +4942,150 @@ async function doLogout(){
 }
 
 // ============================================================
+// 千葉大リスト (病名 / 術式) — KV保存。Excelの往復で入れ替える
+// ============================================================
+var chKind = "byomei";      // 今見ている種別
+var chRows = [];
+var chPending = null;       // 取込待ちの行
+
+function chLabel(){ return chKind === "jutsushiki" ? "術式" : "病名"; }
+
+async function openChiba(){
+  $("chModal").classList.remove("hidden");
+  chPending = null;
+  $("chPreview").classList.add("hidden");
+  await loadChiba();
+}
+
+function chSetTab(kind){
+  chKind = kind;
+  $("chTabB").className = "btn" + (kind === "byomei" ? " primary" : "");
+  $("chTabJ").className = "btn" + (kind === "jutsushiki" ? " primary" : "");
+  chPending = null;
+  $("chPreview").classList.add("hidden");
+  loadChiba();
+}
+
+async function loadChiba(){
+  $("chStat").innerHTML = "読込中…";
+  $("chList").innerHTML = "";
+  try {
+    var r = await api("/api/chiba?kind=" + encodeURIComponent(chKind));
+    chRows = r.rows || [];
+    var src = r.stored
+      ? "Excelから取り込んだ内容を使用中"
+      : "コードに内蔵された初期値を使用中（まだ取込をしていません）";
+    $("chStat").innerHTML = '<b>' + chLabel() + ' ' + chRows.length + ' 件</b><br>' +
+      '<span style="color:#8a919c;font-size:12.5px">' + esc(src) + '</span>';
+    var h = '<table class="list"><tr><th style="width:44px">#</th><th>' + chLabel() + '</th></tr>';
+    for (var i=0;i<chRows.length;i++){
+      h += '<tr><td>' + (i+1) + '</td><td>' + esc(chRows[i]) + '</td></tr>';
+    }
+    h += '</table>';
+    $("chList").innerHTML = h;
+  } catch(e){
+    $("chStat").innerHTML = '読み込みに失敗しました: ' + esc(e.message);
+  }
+}
+
+async function exportChiba(){
+  try {
+    await ensureXLSX();
+    if (!chRows.length){ alert("書き出すものがありません"); return; }
+    var aoa = [[chLabel()]];
+    for (var i=0;i<chRows.length;i++) aoa.push([chRows[i]]);
+    var wb = window.XLSX.utils.book_new();
+    var ws = window.XLSX.utils.aoa_to_sheet(aoa);
+    ws["!cols"] = [{wch:52}];
+    window.XLSX.utils.book_append_sheet(wb, ws, "chiba-" + chKind);
+    window.XLSX.writeFile(wb, "オペコピ_千葉大" + chLabel() + "リスト.xlsx");
+    toast("書き出しました");
+  } catch(e){
+    alert("書き出しに失敗: " + e.message);
+  }
+}
+
+async function onChFile(ev){
+  var f = ev.currentTarget.files && ev.currentTarget.files[0];
+  ev.currentTarget.value = "";
+  if (!f) return;
+  try {
+    await ensureXLSX();
+    var buf = await f.arrayBuffer();
+    var wb = window.XLSX.read(buf, { type:"array" });
+    var ws = wb.Sheets[wb.SheetNames[0]];
+    var rows = window.XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+    var out = [];
+    var seen = {};
+    var dup = 0;
+    for (var i=0;i<rows.length;i++){
+      var v = String((rows[i] && rows[i][0]) == null ? "" : rows[i][0]).trim();
+      if (!v) continue;
+      if (i === 0 && (v === "病名" || v === "術式")) continue;   // 見出し行
+      if (seen[v]){ dup++; continue; }
+      seen[v] = 1;
+      out.push(v);
+    }
+    if (!out.length){ alert("取り込める行がありませんでした。A列に1行1語で入れてください。"); return; }
+    chPending = out;
+    var diff = out.length - chRows.length;
+    var diffTxt = diff === 0 ? "件数は変わりません"
+      : (diff > 0 ? (diff + " 件 増えます") : ((-diff) + " 件 減ります"));
+    var h = '<div style="font-weight:700;margin-bottom:6px">取込内容の確認（' + chLabel() + '）</div>' +
+      '<div>現在 <b>' + chRows.length + '</b> 件 → 取込後 <b>' + out.length + '</b> 件（' + diffTxt + '）</div>';
+    if (dup) h += '<div style="color:#8a919c;font-size:13px;margin-top:4px">※ 同じ語が ' + dup + ' 件あったので1つにまとめました</div>';
+    h += '<div style="font-size:12.5px;color:#8a919c;margin-top:6px">先頭3件: ' + esc(out.slice(0,3).join(" / ")) + '</div>' +
+      '<div class="bar" style="margin-top:10px">' +
+      '<button class="btn primary" id="chCommit">この内容で入れ替える</button>' +
+      '<button class="btn" id="chCancel">やめる</button></div>';
+    $("chPreview").innerHTML = h;
+    $("chPreview").classList.remove("hidden");
+    $("chCommit").addEventListener("click", commitChiba);
+    $("chCancel").addEventListener("click", function(){
+      chPending = null;
+      $("chPreview").classList.add("hidden");
+    });
+  } catch(e){
+    alert("読み込みに失敗: " + e.message);
+  }
+}
+
+async function commitChiba(){
+  if (!chPending) return;
+  var btn = $("chCommit");
+  btn.disabled = true; btn.textContent = "保存中…";
+  try {
+    var r = await api("/api/chiba", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ kind: chKind, rows: chPending })
+    });
+    toast(r.count + " 件を登録しました");
+    chPending = null;
+    $("chPreview").classList.add("hidden");
+    await loadChiba();
+  } catch(e){
+    alert("保存に失敗: " + e.message);
+    btn.disabled = false; btn.textContent = "この内容で入れ替える";
+  }
+}
+
+async function resetChiba(){
+  if (!confirm("取り込んだ" + chLabel() + "リストを消して、内蔵の初期値に戻します。よろしい？")) return;
+  try {
+    await api("/api/chiba", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ kind: chKind, reset: true })
+    });
+    toast("初期値に戻しました");
+    chPending = null;
+    $("chPreview").classList.add("hidden");
+    await loadChiba();
+  } catch(e){
+    alert("失敗: " + e.message);
+  }
+}
+
+// ============================================================
 // 術式マスタ (Kコード) — KV保存。Excelの往復で改訂に対応する
 // ============================================================
 var kcPending = null;   // 取込待ちの行
@@ -4725,6 +5302,125 @@ async function delUser(id){
 }
 
 // ============================================================
+// 千葉大フォームの入力作業
+//   読み取り済みの症例から千葉大用の項目だけを取り出して並べる。
+//   担当者はここを上から順に潰していけばよい。
+// ============================================================
+var cwDoneMode = false;
+
+function recShowTab(chiba){
+  $("recPaneAll").classList.toggle("hidden", chiba);
+  $("recPaneChiba").classList.toggle("hidden", !chiba);
+  $("recTabAll").className = "btn" + (chiba ? "" : " primary");
+  $("recTabChiba").className = "btn" + (chiba ? " primary" : "");
+  if (chiba) loadChibaWork();
+}
+
+async function loadChibaWork(){
+  $("cwBody").innerHTML = '<div class="empty">読込中…</div>';
+  var p = [];
+  p.push("done=" + (cwDoneMode ? "1" : "0"));
+  var fr = $("cwFrom").value, to = $("cwTo").value;
+  if (fr) p.push("from=" + encodeURIComponent(fr.replace(/-/g, "/")));
+  if (to) p.push("to=" + encodeURIComponent(to.replace(/-/g, "/")));
+  try {
+    var r = await api("/api/chiba/work?" + p.join("&"));
+    var rs = r.records || [];
+    $("cwCount").textContent = rs.length ? (rs.length + " 件") : "";
+    if (!rs.length){
+      $("cwBody").innerHTML = '<div class="empty">' +
+        (cwDoneMode ? "入力済みの症例はありません" : "入力待ちの症例はありません \uD83C\uDF89") + '</div>';
+      return;
+    }
+    var h = "";
+    for (var i=0;i<rs.length;i++){
+      var x = rs[i];
+      h += '<div style="border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px;background:#fff">' +
+           '<div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:8px">' +
+             '<b>症例 #' + esc(x.id) + '</b>' +
+             '<span>患者ID ' + esc(x.patient_no || "-") + '</span>' +
+             '<span>' + esc(x.surgery_date || "-") + '</span>' +
+             '<span style="color:#8a919c;font-size:12px">' + esc(x.master_name || "") +
+               (x.updated_by ? "／読取 " + esc(x.updated_by) : "") + '</span>' +
+             '<span style="margin-left:auto">' +
+               '<button class="btn mini" data-cwcopy="' + i + '">\uD83D\uDCCB まとめてコピー</button> ' +
+               (cwDoneMode
+                 ? '<button class="btn mini" data-cwundo="' + esc(x.id) + '">↩ 未入力に戻す</button>'
+                 : '<button class="btn mini teal" data-cwok="' + esc(x.id) + '">\u2705 入力済みにする</button>') +
+             '</span>' +
+           '</div>';
+      var fs = x.fields || [];
+      if (!fs.length){
+        h += '<div class="hint">千葉大用の項目がありません</div>';
+      } else {
+        h += '<table class="list"><tr><th style="width:34%">項目</th><th>値</th><th style="width:56px"></th></tr>';
+        for (var j=0;j<fs.length;j++){
+          h += '<tr><td>' + esc(fs[j].label) + '</td>' +
+               '<td>' + (fs[j].value ? esc(fs[j].value) : '<span style="color:#c9821a">（空）</span>') + '</td>' +
+               '<td><button class="btn mini" data-cwv="' + i + '-' + j + '">\uD83D\uDCCB</button></td></tr>';
+        }
+        h += '</table>';
+      }
+      if (cwDoneMode && x.chiba_at){
+        h += '<div class="hint" style="margin-top:6px">入力済み: ' + esc(recFmt(x.chiba_at)) + '</div>';
+      }
+      h += '</div>';
+    }
+    $("cwBody").innerHTML = h;
+
+    // 1項目コピー
+    var vs = $("cwBody").querySelectorAll("button[data-cwv]");
+    for (var a=0;a<vs.length;a++){
+      vs[a].addEventListener("click", function(ev){
+        var t = ev.currentTarget.getAttribute("data-cwv").split("-");
+        var f = rs[Number(t[0])].fields[Number(t[1])];
+        copyText(f ? f.value : "");
+      });
+    }
+    // まとめてコピー
+    var cps = $("cwBody").querySelectorAll("button[data-cwcopy]");
+    for (var b=0;b<cps.length;b++){
+      cps[b].addEventListener("click", function(ev){
+        var x = rs[Number(ev.currentTarget.getAttribute("data-cwcopy"))];
+        var lines = [];
+        for (var k=0;k<(x.fields||[]).length;k++){
+          lines.push(x.fields[k].label + ": " + (x.fields[k].value || ""));
+        }
+        copyText(lines.join(String.fromCharCode(10)));
+      });
+    }
+    // 入力済み / 戻す
+    var oks = $("cwBody").querySelectorAll("button[data-cwok]");
+    for (var c=0;c<oks.length;c++){
+      oks[c].addEventListener("click", function(ev){
+        setChibaDone(ev.currentTarget.getAttribute("data-cwok"), true);
+      });
+    }
+    var un = $("cwBody").querySelectorAll("button[data-cwundo]");
+    for (var e2=0;e2<un.length;e2++){
+      un[e2].addEventListener("click", function(ev){
+        setChibaDone(ev.currentTarget.getAttribute("data-cwundo"), false);
+      });
+    }
+  } catch(e){
+    $("cwBody").innerHTML = '<div class="empty">読み込みに失敗しました: ' + esc(e.message) + '</div>';
+  }
+}
+
+async function setChibaDone(id, done){
+  try {
+    await api("/api/chiba/done", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ id: Number(id), done: done })
+    });
+    toast(done ? "入力済みにしました" : "未入力に戻しました");
+    await loadChibaWork();
+  } catch(e){
+    alert("失敗: " + e.message);
+  }
+}
+
+// ============================================================
 // 症例台帳 (D1)
 //   /api/records で一覧、/api/record?id= で1件、/api/record/delete で削除
 // ============================================================
@@ -4749,6 +5445,7 @@ function recQuery(offset){
 
 async function openRecords(){
   $("recModal").classList.remove("hidden");
+  recShowTab(false);
   $("recDetail").classList.add("hidden");
   // 用紙の絞り込み候補を、読み込み済みのマスタ一覧から作る
   var sel = $("recQMaster");
@@ -4965,6 +5662,17 @@ $("btnDoc").addEventListener("click", openDoctors);
 $("btnRec").addEventListener("click", openRecords);
 $("btnUsers").addEventListener("click", openUsers);
 $("btnKc").addEventListener("click", openKcodes);
+$("btnChiba").addEventListener("click", openChiba);
+$("chClose").addEventListener("click", function(){ $("chModal").classList.add("hidden"); });
+$("chTabB").addEventListener("click", function(){ chSetTab("byomei"); });
+$("chTabJ").addEventListener("click", function(){ chSetTab("jutsushiki"); });
+$("chExport").addEventListener("click", exportChiba);
+$("chImport").addEventListener("click", function(){ $("chFile").click(); });
+$("chFile").addEventListener("change", onChFile);
+$("chReset").addEventListener("click", resetChiba);
+$("chModal").addEventListener("click", function(ev){
+  if (ev.target === $("chModal")) $("chModal").classList.add("hidden");
+});
 $("kcClose").addEventListener("click", function(){ $("kcModal").classList.add("hidden"); });
 $("kcExport").addEventListener("click", exportKcodes);
 $("kcImport").addEventListener("click", function(){ $("kcFile").click(); });
@@ -4981,6 +5689,19 @@ $("usrModal").addEventListener("click", function(ev){
 });
 $("recClose").addEventListener("click", function(){ $("recModal").classList.add("hidden"); });
 $("recSearch").addEventListener("click", function(){ loadRecords(true); });
+$("recTabAll").addEventListener("click", function(){ recShowTab(false); });
+$("recTabChiba").addEventListener("click", function(){ recShowTab(true); });
+$("cwTodo").addEventListener("click", function(){
+  cwDoneMode = false;
+  $("cwTodo").className = "btn primary"; $("cwDone").className = "btn";
+  loadChibaWork();
+});
+$("cwDone").addEventListener("click", function(){
+  cwDoneMode = true;
+  $("cwTodo").className = "btn"; $("cwDone").className = "btn primary";
+  loadChibaWork();
+});
+$("cwSearch").addEventListener("click", loadChibaWork);
 $("recMore").addEventListener("click", function(){ loadRecords(false); });
 $("recCsv").addEventListener("click", exportRecordsCsv);
 $("recClear").addEventListener("click", function(){
@@ -5443,6 +6164,25 @@ const FRONT_HTML = `<!DOCTYPE html>
   </div>
 </div>
 <!-- ▲▲ 報告ここまで ▲▲ -->
+
+<!-- ▼▼ 千葉大リストの候補 ▼▼ -->
+<div class="overlay hidden" id="cbModal">
+  <div class="modal">
+    <div class="mhead">\uD83C\uDFEB 千葉大リストの候補</div>
+    <div class="mbody">
+      <div class="bar">
+        <input type="text" id="cbQuery" class="wide" placeholder="手術記録の記載をそのまま入れてね">
+        <button class="btn primary" id="cbRun">\uD83D\uDD0D 検索</button>
+      </div>
+      <div class="hint" style="margin-top:6px">千葉大のフォームで<b>選べる語だけ</b>を、近い順に出しています。</div>
+      <div id="cbList" style="margin-top:10px"></div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="cbClose">閉じる</button>
+    </div>
+  </div>
+</div>
+<!-- ▲▲ 千葉大リストの候補ここまで ▲▲ -->
 
 <!-- ▼▼ 病名候補(ICD-10) ▼▼ -->
 <div class="overlay hidden" id="icModal">
@@ -6094,7 +6834,7 @@ function buildRecordPayload(){
     var val = raw;
     if (isSaveBump(label)) val = bumpPatientId(raw);            // 加工IDだけ +1
     else if (isSaveDuration(label)) val = normalizeDuration(raw);
-    fields.push({ no: it.no, label: label, type: it.type || "", value: val });
+    fields.push({ no: it.no, label: label, section: (it.section || ""), type: it.type || "", value: val });
   }
   return { fields: fields, materials: (typeof subVals === "object" ? subVals : {}) };
 }
@@ -6409,14 +7149,29 @@ function renderResults(){
   }
 
   var lastSec = null;
+  var secId = 0;
+  var inChiba = false;
   for (var i=0;i<items.length;i++){
     var it = items[i];
     var sec = it.section || "";
     if (sec !== lastSec){
-      h += '<div class="secline">' + (sec ? esc(sec) : "（セクションなし）") + '</div>';
+      secId++;
+      inChiba = isChibaSec(sec);
+      if (inChiba){
+        // 千葉大用の項目は、担当者があとでまとめて入力するので畳んでおく
+        h += '<div class="secline sectog" data-sec="' + secId + '" style="cursor:pointer">' +
+             '<span class="secarrow">▶</span> \uD83C\uDFEB ' + esc(sec) +
+             '<span style="font-weight:400;color:#8a919c;font-size:12px">（あとで担当者がまとめて入力します／クリックで開く）</span></div>';
+      } else {
+        h += '<div class="secline">' + (sec ? esc(sec) : "（セクションなし）") + '</div>';
+      }
       lastSec = sec;
     }
-    h += fieldRow(it, i);
+    if (inChiba){
+      h += '<div class="secbody sec' + secId + '" style="display:none">' + fieldRow(it, i) + '</div>';
+    } else {
+      h += fieldRow(it, i);
+    }
   }
 
   // シール一覧
@@ -6458,6 +7213,7 @@ function renderResults(){
 
   $("resultArea").innerHTML = h;
   wireResults();
+  wireSecToggle();
   scheduleSave();
 }
 
@@ -6522,6 +7278,11 @@ function fieldRow(it, idx){
   if (!wantIcd && !it.suggest && (it.type === "ocr" || it.type === "choice")){
     var lb = String(it.label || "");
     if (lb.indexOf("病名") >= 0 || lb.indexOf("診断名") >= 0) wantIcd = true;
+  }
+  if (it.suggest === "chiba-byomei" || it.suggest === "chiba-jutsushiki"){
+    ctrl += '<div style="margin-top:5px"><button class="btn mini" data-cb="' + esc(no) + '" data-kind="' +
+            (it.suggest === "chiba-jutsushiki" ? "jutsushiki" : "byomei") +
+            '">\uD83C\uDFEB 千葉大の候補を出す</button></div>';
   }
   if (wantIcd){
     ctrl += '<div style="margin-top:5px"><button class="btn mini" data-ic="' + esc(no) + '">\uD83E\uDE7A 病名の候補を出す(AIが推定)</button></div>';
@@ -6648,6 +7409,13 @@ function wireResults(){
     });
   }
 
+  var cbs = area.querySelectorAll("button[data-cb]");
+  for (var w=0;w<cbs.length;w++){
+    cbs[w].addEventListener("click", function(ev){
+      openChibaPick(ev.currentTarget.getAttribute("data-cb"),
+                    ev.currentTarget.getAttribute("data-kind"));
+    });
+  }
   var ics = area.querySelectorAll("button[data-ic]");
   for (var y=0;y<ics.length;y++){
     ics[y].addEventListener("click", function(ev){
@@ -6839,11 +7607,32 @@ function subBlockText(no){
   return out.join(NL);
 }
 
+// セクション名に「千葉大」が入っていれば千葉大フォーム用
+function isChibaSec(sec){
+  return String(sec == null ? "" : sec).indexOf("千葉大") >= 0;
+}
+
+// セクション見出しをクリックすると中身を開閉する
+function wireSecToggle(){
+  var tg = document.querySelectorAll(".sectog");
+  for (var i=0;i<tg.length;i++){
+    tg[i].addEventListener("click", function(ev){
+      var n = ev.currentTarget.getAttribute("data-sec");
+      var rows = document.querySelectorAll(".sec" + n);
+      var open = rows.length && rows[0].style.display === "none";
+      for (var j=0;j<rows.length;j++) rows[j].style.display = open ? "" : "none";
+      var ar = ev.currentTarget.querySelector(".secarrow");
+      if (ar) ar.textContent = open ? "▼" : "▶";
+    });
+  }
+}
+
 function copyAll(){
   if (!curMaster) return;
   var lines = [];
   for (var i=0;i<curMaster.items.length;i++){
     var it = curMaster.items[i];
+    if (isChibaSec(it.section)) continue;   // 千葉大用はJOANRに貼らないので外す
     var key = String(it.no);
     if (it.type === "sticker" && subVals[key]){
       lines.push(it.label + ":");
@@ -7094,6 +7883,56 @@ async function ensureQrGate(){
 $("qrRenew").addEventListener("click", startQrGate);
 
 // ============================================================
+// 千葉大リストの候補
+//   登録できる語が決まっているので、その一覧から近いものを選ばせる。
+//   リストに無い語は返らない作りになっている。
+// ============================================================
+var cbTargetNo = null;
+var cbKind = "byomei";
+
+function openChibaPick(no, kind){
+  cbTargetNo = no;
+  cbKind = (kind === "jutsushiki") ? "jutsushiki" : "byomei";
+  $("cbQuery").value = results[no] == null ? "" : String(results[no]);
+  $("cbList").innerHTML = "";
+  $("cbModal").classList.remove("hidden");
+  runChibaPick();
+}
+
+async function runChibaPick(){
+  var q = $("cbQuery").value.trim();
+  if (!q){ $("cbList").innerHTML = '<div class="hint">記載を入れてね</div>'; return; }
+  $("cbList").innerHTML = '<div class="hint"><span class="spin"></span> 検索中…</div>';
+  try {
+    var data = await api("/api/chiba/match", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ kind: cbKind, query: q })
+    });
+    var rs = data.results || [];
+    if (!rs.length){ $("cbList").innerHTML = '<div class="hint">候補が見つかりませんでした</div>'; return; }
+    var h = "";
+    for (var i=0;i<rs.length;i++){
+      h += '<div class="kcrow" data-pick="' + i + '">' +
+             '<div class="kcname">' + esc(rs[i].name) + '</div>' +
+             (rs[i].reason ? '<div class="kcreason">' + esc(rs[i].reason) + '</div>' : '') +
+           '</div>';
+    }
+    $("cbList").innerHTML = h;
+    var rows = $("cbList").querySelectorAll(".kcrow");
+    for (var j=0;j<rows.length;j++){
+      rows[j].addEventListener("click", function(ev){
+        var idx = parseInt(ev.currentTarget.getAttribute("data-pick"),10);
+        results[cbTargetNo] = rs[idx].name;
+        $("cbModal").classList.add("hidden");
+        renderResults();
+        toast("反映しました");
+      });
+    }
+  } catch(e){
+    $("cbList").innerHTML = '<div class="hint">検索に失敗: ' + esc(e.message) + '</div>';
+  }
+}
+// ============================================================
 // 病名候補 (ICD-10)
 //   AIの知識だけで出しているので、コードの確認は利用者に委ねる
 // ============================================================
@@ -7194,6 +8033,10 @@ $("btnReport").addEventListener("click", function(ev){ ev.preventDefault(); $("r
 $("rpClose").addEventListener("click", function(){ $("rpModal").classList.add("hidden"); });
 $("rpSend").addEventListener("click", sendReport);
 $("icClose").addEventListener("click", function(){ $("icModal").classList.add("hidden"); });
+$("cbClose").addEventListener("click", function(){ $("cbModal").classList.add("hidden"); });
+$("cbRun").addEventListener("click", runChibaPick);
+$("cbQuery").addEventListener("keydown", function(ev){ if (ev.key === "Enter") runChibaPick(); });
+$("cbModal").addEventListener("click", function(ev){ if (ev.target === $("cbModal")) $("cbModal").classList.add("hidden"); });
 $("icRun").addEventListener("click", runIcd);
 $("icQuery").addEventListener("keydown", function(ev){ if (ev.key === "Enter") runIcd(); });
 $("icModal").addEventListener("click", function(ev){ if (ev.target === $("icModal")) $("icModal").classList.add("hidden"); });
