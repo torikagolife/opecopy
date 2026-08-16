@@ -2790,14 +2790,23 @@ const KCODE_SCHEMA = {
 // ============================================================
 
 // 千葉大の項目を持つ用紙のIDを集める
+//   KVからマスタ本体を読んで、セクション名に「千葉大」が入る項目があるかで判定する
 async function chibaMasterIds(env) {
   const ids = [];
+  if (!env || !env.FORM_KV) return ids;
   try {
-    const list = await loadMasters(env);
-    for (const m of list) {
-      const items = (m && m.items) || [];
+    const res = await env.FORM_KV.list({ prefix: KV_PREFIX });
+    for (const k of res.keys) {
+      const id = k.name.slice(KV_PREFIX.length);
+      let obj = null;
+      try {
+        const raw = await env.FORM_KV.get(k.name, { cacheTtl: 300 });
+        if (!raw) continue;
+        obj = JSON.parse(raw);
+      } catch (e) { continue; }
+      const items = (obj && obj.items) || [];
       for (const it of items) {
-        if (isChibaSection(it.section)) { ids.push(m.id); break; }
+        if (isChibaSection(it.section)) { ids.push(id); break; }
       }
     }
   } catch (e) {}
