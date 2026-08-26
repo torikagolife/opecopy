@@ -2789,14 +2789,36 @@ const KCODE_SCHEMA = {
 //   読み取りとは切り離して「あとでまとめて入力する」ための画面を用意する。
 // ============================================================
 
-// 千葉大の項目を持つ用紙のIDを集める
-//   KVからマスタ本体を読んで、セクション名に「千葉大」が入る項目があるかで判定する
-async function chibaMasterIds(env) {
-  const ids = [];
-  if (!env || !env.FORM_KV) return ids;
+// 用紙の項目のうち、どれが千葉大用かを判定する。
+//   ① セクション名に「千葉大」が入っている
+//   ② 見出し行が項目として取り込まれてしまっている場合(【千葉大用】という名前の項目)
+//      → その行より後ろは全部千葉大用とみなす
+//   ②があるのは、セクション見出しの判定を直す前にExcelを取り込んだマスタでも
+//   ちゃんと動くようにするため。
+function chibaNosOf(items) {
+  const nos = new Set();
+  let after = false;
+  for (const it of items || []) {
+    const lab = String((it && it.label) || "");
+    if (lab.indexOf("千葉大") >= 0 && lab.indexOf("【") >= 0 && lab.indexOf("】") >= 0) {
+      after = true;          // 見出しが項目化されている
+      nos.add(String(it.no)); // 見出し自体も対象にして画面から隠す
+      continue;
+    }
+    if (isChibaSection(it && it.section) || after) nos.add(String(it.no));
+  }
+  return nos;
+}
+
+// 千葉大の項目を持つ用紙を調べる
+//   戻り値: { ids: [用紙ID], nosById: { 用紙ID: Set(項目no) }, scanned: 調べた用紙数 }
+async function chibaMasterInfo(env) {
+  const out = { ids: [], nosById: {}, scanned: 0 };
+  if (!env || !env.FORM_KV) return out;
   try {
     const res = await env.FORM_KV.list({ prefix: KV_PREFIX });
     for (const k of res.keys) {
+      out.scanned++;
       const id = k.name.slice(KV_PREFIX.length);
       let obj = null;
       try {
@@ -2804,23 +2826,25 @@ async function chibaMasterIds(env) {
         if (!raw) continue;
         obj = JSON.parse(raw);
       } catch (e) { continue; }
-      const items = (obj && obj.items) || [];
-      for (const it of items) {
-        if (isChibaSection(it.section)) { ids.push(id); break; }
-      }
+      const nos = chibaNosOf((obj && obj.items) || []);
+      if (nos.size) { out.ids.push(id); out.nosById[id] = nos; }
     }
   } catch (e) {}
-  return ids;
+  return out;
 }
 
-// payloadから千葉大セクションの項目だけ取り出す
-function pickChibaFields(payload) {
+// payloadから千葉大の項目だけ取り出す。
+// 古い記録にはセクションが入っていないので、用紙側の項目番号でも拾えるようにする。
+function pickChibaFields(payload, noSet) {
   let p = {};
   try { p = JSON.parse(payload || "{}"); } catch (e) { return []; }
   const out = [];
   for (const f of (p.fields || [])) {
-    if (!isChibaSection(f.section)) continue;
-    out.push({ no: f.no, label: f.label, value: f.value == null ? "" : String(f.value) });
+    const byNo = noSet && noSet.has(String(f.no));
+    if (!isChibaSection(f.section) && !byNo) continue;
+    const lab = String(f.label || "");
+    if (lab.indexOf("【") >= 0 && lab.indexOf("】") >= 0) continue;   // 見出し行は出さない
+    out.push({ no: f.no, label: lab, value: f.value == null ? "" : String(f.value) });
   }
   return out;
 }
@@ -2829,8 +2853,15 @@ async function listChibaWork(env, params) {
   if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
   const p = params || new URLSearchParams();
   const done = (p.get("done") || "") === "1";
-  const ids = await chibaMasterIds(env);
-  if (!ids.length) return jsonOk({ records: [], count: 0, note: "千葉大用の項目を持つ用紙がありません" });
+  const info = await chibaMasterInfo(env);
+  const ids = info.ids;
+  if (!ids.length) {
+    return jsonOk({
+      records: [], count: 0,
+      note: "千葉大用の項目を持つ用紙が見つかりませんでした（" + info.scanned + "件の用紙を確認）。" +
+            "対象用紙マスタで、千葉大の項目のセクション名に「千葉大」が入っているか確認してください。",
+    });
+  }
 
   const holes = ids.map(() => "?").join(",");
   const where = ["deleted_at IS NULL", "master_id IN (" + holes + ")"];
@@ -2844,7 +2875,7 @@ async function listChibaWork(env, params) {
   if (!(limit > 0) || limit > 200) limit = 50;
 
   const sql =
-    "SELECT id, patient_no, surgery_date, master_name, updated_by, updated_at, chiba_at, payload " +
+    "SELECT id, patient_no, surgery_date, master_id, master_name, updated_by, updated_at, chiba_at, payload " +
     "FROM records WHERE " + where.join(" AND ") +
     " ORDER BY surgery_date ASC, id ASC LIMIT ?";
   const rs = await env.opecopy_db.prepare(sql).bind(...args, limit).all();
@@ -2855,7 +2886,7 @@ async function listChibaWork(env, params) {
     records.push({
       id: r.id, patient_no: r.patient_no, surgery_date: r.surgery_date,
       master_name: r.master_name, updated_by: r.updated_by, updated_at: r.updated_at,
-      chiba_at: r.chiba_at, fields: pickChibaFields(r.payload),
+      chiba_at: r.chiba_at, fields: pickChibaFields(r.payload, info.nosById[r.master_id]),
     });
   }
   return jsonOk({ records: records, count: records.length, done: done });
@@ -5338,7 +5369,8 @@ async function loadChibaWork(){
     $("cwCount").textContent = rs.length ? (rs.length + " 件") : "";
     if (!rs.length){
       $("cwBody").innerHTML = '<div class="empty">' +
-        (cwDoneMode ? "入力済みの症例はありません" : "入力待ちの症例はありません \uD83C\uDF89") + '</div>';
+        (r.note ? esc(r.note)
+                : (cwDoneMode ? "入力済みの症例はありません" : "入力待ちの症例はありません \uD83C\uDF89")) + '</div>';
       return;
     }
     var h = "";
@@ -7160,9 +7192,23 @@ function renderResults(){
   var lastSec = null;
   var secId = 0;
   var inChiba = false;
+  var afterMark = false;   // 見出しが項目として取り込まれている場合の目印
   for (var i=0;i<items.length;i++){
     var it = items[i];
+    var lb = String(it.label || "");
+    if (lb.indexOf("千葉大") >= 0 && lb.indexOf("【") >= 0 && lb.indexOf("】") >= 0){
+      // 見出し行が項目になっているマスタ。ここから下を千葉大用として畳む
+      afterMark = true;
+      secId++;
+      inChiba = true;
+      lastSec = "\u0000chiba";
+      h += '<div class="secline sectog" data-sec="' + secId + '" style="cursor:pointer">' +
+           '<span class="secarrow">▶</span> \uD83C\uDFEB ' + esc(lb.replace("【","").replace("】","")) +
+           '<span style="font-weight:400;color:#8a919c;font-size:12px">（あとで担当者がまとめて入力します／クリックで開く）</span></div>';
+      continue;
+    }
     var sec = it.section || "";
+    if (afterMark) sec = lastSec;   // 目印より後ろは同じ扱いにする
     if (sec !== lastSec){
       secId++;
       inChiba = isChibaSec(sec);
@@ -7639,9 +7685,15 @@ function wireSecToggle(){
 function copyAll(){
   if (!curMaster) return;
   var lines = [];
+  var skipRest = false;
   for (var i=0;i<curMaster.items.length;i++){
     var it = curMaster.items[i];
-    if (isChibaSec(it.section)) continue;   // 千葉大用はJOANRに貼らないので外す
+    var lb0 = String(it.label || "");
+    if (lb0.indexOf("千葉大") >= 0 && lb0.indexOf("【") >= 0 && lb0.indexOf("】") >= 0){
+      skipRest = true;   // 見出しが項目化されているマスタ
+      continue;
+    }
+    if (skipRest || isChibaSec(it.section)) continue;   // 千葉大用はJOANRに貼らないので外す
     var key = String(it.no);
     if (it.type === "sticker" && subVals[key]){
       lines.push(it.label + ":");
