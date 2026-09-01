@@ -3578,6 +3578,15 @@ const ADMIN_HTML = `<!DOCTYPE html>
     </div>
 
     <div id="itemsBody"></div>
+
+    <!-- 項目が多いと上まで戻るのが大変なので、下にも同じボタンを置く -->
+    <div class="bar" style="margin-top:14px">
+      <button class="btn" id="btnBack2">← 一覧へ</button>
+      <button class="btn primary" id="btnSave2">\uD83D\uDCBE 保存</button>
+      <span class="spacer"></span>
+      <button class="btn" id="btnAddItem2">➕ 項目を追加</button>
+      <button class="btn" id="btnTop">↑ 上へ</button>
+    </div>
   </section>
 
 </div>
@@ -5844,6 +5853,19 @@ $("btnSave").addEventListener("click", saveMaster);
 $("btnAddItem").addEventListener("click", addItem);
 $("btnJson").addEventListener("click", openJson);
 
+// 画面下のボタン(上のものと同じ働き)
+$("btnBack2").addEventListener("click", function(){ $("btnBack").click(); });
+$("btnSave2").addEventListener("click", saveMaster);
+$("btnAddItem2").addEventListener("click", function(){
+  addItem();
+  // 追加した行が見えるように下端へ送る
+  var b = $("btnAddItem2");
+  if (b && b.scrollIntoView) b.scrollIntoView({ behavior: "smooth", block: "end" });
+});
+$("btnTop").addEventListener("click", function(){
+  window.scrollTo({ top: 0, behavior: "smooth" });
+});
+
 $("impCancel").addEventListener("click", function(){ $("impModal").classList.add("hidden"); });
 $("impRun").addEventListener("click", runImport);
 $("xlFile").addEventListener("change", onXlFile);
@@ -6109,7 +6131,7 @@ const FRONT_HTML = `<!DOCTYPE html>
     <small>手術記録用紙 → JOANR入力補助</small>
     <span id="meBox" style="margin-left:auto;font-size:12.5px;color:#8a919c;align-self:center"></span>
     <a href="__HELP_URL__" id="btnHelp" target="_blank" rel="noopener">\u2753 ヘルプ</a>
-    <a href="#" id="btnReport">\uD83D\uDCE3 報告</a>
+    <a href="#" id="btnReport">\uD83D\uDCE3 DAへ</a>
     <a href="/admin">⚙️ 管理画面</a>
     <a href="#" id="btnLogout">\uD83D\uDEAA ログアウト</a>
   </div>
@@ -6193,10 +6215,10 @@ const FRONT_HTML = `<!DOCTYPE html>
 <!-- ▼▼ 報告 ▼▼ -->
 <div class="overlay hidden" id="rpModal">
   <div class="modal">
-    <div class="mhead">\uD83D\uDCE3 管理者へ報告</div>
+    <div class="mhead">\uD83D\uDCE3 DA課へ報告</div>
     <div class="mbody">
-      <div class="hint">読み取りのミスやマスタの直してほしい所を書いてください。総務の管理画面に届きます（30日で自動的に消えます）。</div>
-      <textarea id="rpBody" spellcheck="false" style="width:100%;min-height:150px;padding:10px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:14px;margin-top:8px" placeholder="例) TKAの「手術時間」がよく読み取れていません。用紙の右下にあります。マスタの見直しをお願いします。"></textarea>
+      <div class="hint">読み取りのミスや、判断に迷って仮登録のままにした症例を知らせてください。DA課の管理画面に届きます（30日で自動的に消えます）。</div>
+      <textarea id="rpBody" spellcheck="false" style="width:100%;min-height:150px;padding:10px;border:1px solid var(--line);border-radius:10px;font-family:inherit;font-size:14px;margin-top:8px" placeholder="例) ○月○日手術の XXXXX さん、自分では判断できない XXXX があり仮登録状態です。&#10;&#10;例) TKAの「手術時間」がよく読み取れていません。用紙の右下にあります。マスタの見直しをお願いします。"></textarea>
     </div>
     <div class="mfoot">
       <button class="btn" id="rpClose">閉じる</button>
