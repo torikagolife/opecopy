@@ -3135,6 +3135,27 @@ async function apiChibaMatch(env, body) {
   return jsonOk({ results: results, usage: out.usage || null });
 }
 
+const KCODE_SYSTEM = [
+  "あなたは勤続20年のベテラン診療報酬請求事務の専門家です。整形外科の手術に対する診療行為(Kコード)の選定を日常業務として何万件も処理してきました。",
+  "手術記録に書かれた術式の表現(略語・英語・通称・カルテ特有の崩れた表記・複数術式の併記を含む)から、算定すべき診療行為を言い当てることができます。",
+  "",
+  "# 依頼",
+  "入力された術式の表現に対し、提供された登録術式リストの中から適切なものを、確からしい順に5件選んでください。",
+  "",
+  "# 厳守事項",
+  "- リストにある診療行為コードだけを返すこと。リストに無いコードや、自分で組み立てたコードは絶対に返さないこと。",
+  "- 部位(肩・肘・手・股・膝・足・脊椎など)が入力にある場合は、その部位に対応する区分を優先すること。関節の大小区分(大関節・中関節・小関節)の違いにも注意すること。",
+  "- 到達法や手技の区別(観血的/徒手的、鏡視下(内視鏡下)/直視下、顕微鏡下)が入力にある場合は、それを反映した区分を優先すること。",
+  "- 人工関節は「置換術」と「再置換術」を取り違えないこと。入力に再置換・revision・抜去・入替などの語があれば再置換側を優先する。",
+  "- 骨折の手術は「骨折観血的手術」「骨内異物(挿入物)除去術(抜釘)」「創外固定」「骨折経皮的鋼線刺入固定術」などが紛らわしいので、記載された処置の内容に合うものを選ぶこと。",
+  "- 脊椎は固定術・除圧術・椎間板摘出術で区分が分かれ、椎間数や到達法(前方/後方)でも変わる。記載に合う区分を選ぶこと。",
+  "- 複数の術式が書かれている場合は、主たる術式を1位にし、併せて行った術式を下位の候補に含めること。",
+  "- 「その他のもの」に安易に逃げないこと。より具体的に該当する区分があれば、そちらを上位にすること。",
+  "- 部位や手技が特定できず候補を絞りきれない場合は、可能性のある部位違い・手技違いの区分を並べ、利用者が選べるようにすること。",
+  "- 5件は必ず異なる診療行為コードにすること。同じコードを重複させないこと。",
+  "- reasonは選定理由を15文字以内で簡潔に書くこと。部位や手技のどこを根拠にしたかが分かると役に立つ。",
+].join("\n");
+
 async function apiKcode(env, body) {
   const query = String((body && body.query) || "").trim();
   if (!query) return jsonError("術式名を入力してください", 400);
@@ -3145,12 +3166,7 @@ async function apiKcode(env, body) {
   const byCode = kcodeMap(kcodeRows);
   const listText = kcodeRows.map((r) => r[2] + "\t" + r[0] + "\t" + r[1]).join("\n");
 
-  const systemPrompt =
-    "あなたは整形外科の診療報酬請求に詳しい医療事務アシスタントです。" +
-    "ユーザーが入力した術式名(略語・英語・通称・表記ゆれを含む)に対し、" +
-    "提供された登録術式リストの中から意味的に最も近いものを近い順に5件選びます。" +
-    "リストにないコードは絶対に返さないでください。" +
-    "reasonは選定理由を15文字以内で簡潔に。";
+  const systemPrompt = KCODE_SYSTEM;
 
   const userPrompt =
     "# 入力された術式\n" + query + "\n\n" +
@@ -3167,10 +3183,14 @@ async function apiKcode(env, body) {
 
   // コードをローカルの正データに逆引き(転記ミス・幻覚の防止)
   const results = [];
+  const used = new Set();
   const raw = (out.json && out.json.results) || [];
   for (const r of raw) {
-    const row = byCode.get(String(r.code || "").trim());
+    const code = String(r.code || "").trim();
+    const row = byCode.get(code);
     if (!row) continue;                       // リスト外のコードは捨てる
+    if (used.has(code)) continue;             // 同じコードは1回だけ
+    used.add(code);
     results.push({ kcode: row[0], name: row[1], code: row[2], reason: String(r.reason || "") });
     if (results.length >= 5) break;
   }
@@ -6845,14 +6865,27 @@ function isSaveDuration(label){ return saveLabelHit(label, SAVE_DURATION_LABELS)
 //   ※ もし画面表示の時点で既に +1 済みの値が results に入っているなら、
 //      二重加工を防ぐため、この関数は s をそのまま返すように直すこと。
 function bumpPatientId(v){
-  // 「加工ID」の項目だけに使う。患者IDに+1した数値にする。
-  // 0000222415 → 0000222416 のように、先頭のゼロ埋めの桁数はそのまま保つ。
+  // 「加工ID」の項目だけに使う。患者IDに+1して、下6桁だけを残す。
+  //   0000222415 → 222416
   var s = String(v == null ? "" : v).trim();
   if (s === "") return "";
   if (!/^[0-9]+$/.test(s)) return s;          // 数字だけでなければ触らない
   var n = String(Number(s) + 1);
-  while (n.length < s.length) n = "0" + n;    // 元の桁数までゼロで埋め直す
-  return n;
+  while (n.length < s.length) n = "0" + n;    // いったん元の桁数に戻す
+  return n.length > 6 ? n.slice(-6) : n;      // 下6桁だけ使う
+}
+
+// 読み取り結果のうち、加工IDの項目を画面上でも加工後の値にそろえる。
+// (時間と同じく、画面・コピー・台帳がすべて同じ値になる)
+function normalizeBumpFields(){
+  var items = (curMaster && curMaster.items) || [];
+  for (var i = 0; i < items.length; i++){
+    var it = items[i];
+    if (!isSaveBump(it.label || "")) continue;
+    var key = String(it.no);
+    if (results[key] == null || results[key] === "") continue;
+    results[key] = bumpPatientId(results[key]);
+  }
 }
 
 // 読み取り結果のうち、時間の項目をまとめて h:mm に直す。
@@ -6894,9 +6927,8 @@ function buildRecordPayload(){
     if (isSaveName(label)) continue;                 // 氏名は保存しない
     var raw = results[String(it.no)];
     raw = (raw == null ? "" : String(raw));
+    // 加工IDと時間は読み取り直後に画面上でそろえてあるので、ここでは加工しない
     var val = raw;
-    if (isSaveBump(label)) val = bumpPatientId(raw);            // 加工IDだけ +1
-    else if (isSaveDuration(label)) val = normalizeDuration(raw);
     fields.push({ no: it.no, label: label, section: (it.section || ""), type: it.type || "", value: val });
   }
   return { fields: fields, materials: (typeof subVals === "object" ? subVals : {}) };
@@ -7018,6 +7050,7 @@ async function run(){
       results = ex.results || {};
       curMaster = ex.master;
       normalizeDurationFields();   // 手術時間・麻酔時間を 1:33 の形にそろえる
+      normalizeBumpFields();       // 加工IDを +1 して下6桁にそろえる
       disagree = ex.disagree || {};
       snapped = ex.snapped || {};
       doctorInfo = ex.doctorInfo || null;
@@ -7142,9 +7175,13 @@ function assignStickers(){
 }
 
 // JOANRのコンポーネント入力欄(カタログNo/メーカー名/商品名/ロットNo)に合わせて分解する
+//   ロットNoは LOT を優先する。LOTが読めず SN(シリアル)だけがある場合は、
+//   SNをロットNoとして使う。
 function labelToSub(l){
+  var sn  = String(l.sn  || "").trim();
+  var lot = String(l.lot || "").trim();
   return { catalog: l.ref || "", maker: l.maker || "", name: l.title || "",
-           lot: l.lot || "", sn: l.sn || "", exp: l.exp || "" };
+           lot: (lot || sn), sn: sn, exp: l.exp || "" };
 }
 function emptySub(){ return { catalog:"", maker:"", name:"", lot:"", sn:"", exp:"" }; }
 
