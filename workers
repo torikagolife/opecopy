@@ -237,6 +237,18 @@ export default {
       if (method === "GET" && path === "/api/records") {
         return await listRecords(env, url.searchParams);
       }
+      if (method === "GET" && path === "/api/schedule/find") {
+        return await apiFindSchedule(env, url.searchParams);
+      }
+      if (method === "GET" && path === "/api/schedule") {
+        return await apiScheduleStat(env);
+      }
+      if (method === "POST" && path === "/api/schedule") {
+        return await apiSaveSchedule(env, await request.json());
+      }
+      if (method === "POST" && path === "/api/schedule/delete") {
+        return await apiDeleteSchedule(env, await request.json());
+      }
       if (method === "GET" && path === "/api/chiba/work") {
         return await listChibaWork(env, url.searchParams);
       }
@@ -311,6 +323,8 @@ async function listMasters(env) {
       name: m.name || id,
       count: typeof m.count === "number" ? m.count : null,
       stickerTodo: typeof m.stickerTodo === "number" ? m.stickerTodo : null,
+      hasSticker: (typeof m.hasSticker === "boolean") ? m.hasSticker
+                : (typeof m.stickerTodo === "number" ? null : null),
       updatedAt: m.updatedAt || null,
     });
   }
@@ -377,9 +391,19 @@ async function saveMaster(env, body) {
 
   if (!items.length) return jsonError("項目が1つもありません", 400);
 
+  // シール用紙の有無。未指定のときは、シール項目があるかどうかで決める
+  //   (これまでのマスタを読み込んでも自然な既定値になる)
+  let hasSticker;
+  if (body && typeof body.hasSticker === "boolean") {
+    hasSticker = body.hasSticker;
+  } else {
+    hasSticker = items.some((it) => it.type === "sticker");
+  }
+
   const master = {
     id,
     name,
+    hasSticker,
     updatedAt: new Date().toISOString(),
     items,
   };
@@ -394,6 +418,7 @@ async function saveMaster(env, body) {
       name: master.name,
       count: items.length,
       stickerTodo,
+      hasSticker,
       updatedAt: master.updatedAt,
     },
   });
@@ -440,6 +465,7 @@ async function saveRecord(env, body, authUser) {
   const mId = b.master_id || null;
   const mName = b.master_name || null;
   const pNo = b.patient_no || null;
+  const kana = b.kana == null ? null : String(b.kana).trim();
   const sDate = b.surgery_date || null;
   const status = b.status || "draft";
 
@@ -447,13 +473,13 @@ async function saveRecord(env, body, authUser) {
     // 読み直しのときは、日時も登録者も「最後に読み込んだ人」に更新する
     // (不明点を先輩に引き継いで処理してもらう運用があるため)
     await env.opecopy_db.prepare(
-      "UPDATE records SET updated_at=?, updated_by=?, created_by=CASE WHEN ?='' THEN created_by ELSE ? END, master_id=?, master_name=?, patient_no=?, surgery_date=?, status=?, payload=?, file_hash=COALESCE(NULLIF(?,''), file_hash) WHERE id=? AND deleted_at IS NULL"
-    ).bind(now, by, by, by, mId, mName, pNo, sDate, status, payload, fileHash, id).run();
+      "UPDATE records SET updated_at=?, updated_by=?, created_by=CASE WHEN ?='' THEN created_by ELSE ? END, master_id=?, master_name=?, patient_no=?, kana=COALESCE(NULLIF(?,''), kana), surgery_date=?, status=?, payload=?, file_hash=COALESCE(NULLIF(?,''), file_hash) WHERE id=? AND deleted_at IS NULL"
+    ).bind(now, by, by, by, mId, mName, pNo, kana || "", sDate, status, payload, fileHash, id).run();
     return jsonOk({ id: id, updated: true });
   }
   const res = await env.opecopy_db.prepare(
-    "INSERT INTO records (created_at, updated_at, created_by, updated_by, master_id, master_name, patient_no, surgery_date, status, payload, file_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-  ).bind(now, now, by, by, mId, mName, pNo, sDate, status, payload, fileHash || null).run();
+    "INSERT INTO records (created_at, updated_at, created_by, updated_by, master_id, master_name, patient_no, kana, surgery_date, status, payload, file_hash) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+  ).bind(now, now, by, by, mId, mName, pNo, kana, sDate, status, payload, fileHash || null).run();
   const newId = res && res.meta ? res.meta.last_row_id : null;
   return jsonOk({ id: newId, created: true });
 }
@@ -501,7 +527,7 @@ async function listRecords(env, params) {
   let offset = parseInt(p.get("offset") || "0", 10);
   if (!(offset >= 0)) offset = 0;
   const sql =
-    "SELECT id, created_at, updated_at, created_by, updated_by, master_id, master_name, patient_no, surgery_date, status FROM records WHERE " +
+    "SELECT id, created_at, updated_at, created_by, updated_by, master_id, master_name, patient_no, kana, surgery_date, status FROM records WHERE " +
     where.join(" AND ") + " ORDER BY id DESC LIMIT ? OFFSET ?";
   const stmt = env.opecopy_db.prepare(sql);
   const rs = await stmt.bind(...args, limit, offset).all();
@@ -1116,6 +1142,8 @@ function isAdminApi(method, path) {
   if (path === "/api/kcodes") return true;
   if (path === "/api/chiba") return true;   // 一致検索(/api/chiba/match)は利用者も使う
   if (path === "/api/chiba/work" || path === "/api/chiba/done") return true;
+  if (path === "/api/schedule" || path === "/api/schedule/delete") return true;
+  // /api/schedule/find は読み取り画面から使うので管理者専用にしない
   if (path === "/api/reports") return true;
   if (path === "/api/report/read" || path === "/api/report/delete") return true;
   if (path === "/api/mailtpl") return true;
@@ -2783,6 +2811,136 @@ const KCODE_SCHEMA = {
 };
 
 // ============================================================
+// 手術予定CSV (ope_schedule)
+//   院内システムから出る手術記録表を取り込んでおき、
+//   読み取り時に「患者ID下6桁 + 手術日」で引いて値を埋める。
+//   CSVは手術部システムの原本なので、OCRより確かな情報として扱う。
+//   ※氏名は姓名のカナだけを保存する(漢字とフルネームは取り込まない)
+// ============================================================
+const SCHED_KEEP_MONTHS = 3;   // 何か月分を残すか
+
+// 2026.04.01 / 2026/4/1 → 2026/04/01 にそろえる
+function schedDate(v) {
+  const s = String(v || "").trim().replace(/[.\-]/g, "/");
+  const m = s.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})/);
+  if (!m) return "";
+  return m[1] + "/" + ("0" + m[2]).slice(-2) + "/" + ("0" + m[3]).slice(-2);
+}
+
+// 患者番号を下6桁にそろえる(伝票の0埋め10桁とCSVの6桁を同じ値にする)
+function schedPid(v) {
+  const s = String(v || "").trim().replace(/[^0-9]/g, "");
+  if (!s) return "";
+  return s.length > 6 ? s.slice(-6) : s;
+}
+
+// 「9:12」と「9:58」から「0:46」を作る。JOANRの手術時間は執刀開始〜執刀終了。
+function schedDurationBetween(a, b) {
+  const p = (t) => {
+    const m = String(t || "").trim().match(/^(\d{1,2})[:：](\d{1,2})$/);
+    return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+  };
+  const s = p(a), e = p(b);
+  if (s === null || e === null) return "";
+  let d = e - s;
+  if (d < 0) d += 24 * 60;          // 日をまたいだ場合
+  return Math.floor(d / 60) + ":" + ("0" + (d % 60)).slice(-2);
+}
+
+// 患者番号+1の下6桁(加工ID)
+function schedKakoId(pid) {
+  const s = String(pid || "").trim();
+  if (!s || /[^0-9]/.test(s)) return "";
+  let n = String(Number(s) + 1);
+  while (n.length < s.length) n = "0" + n;
+  return n.length > 6 ? n.slice(-6) : n;
+}
+
+async function apiSaveSchedule(env, body) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const rows = (body && Array.isArray(body.rows)) ? body.rows : [];
+  if (!rows.length) return jsonError("取り込める行がありません", 400);
+
+  const now = new Date().toISOString();
+  const stmts = [];
+  let skipped = 0;
+  for (const r of rows) {
+    const pid = schedPid(r.patient_no);
+    const date = schedDate(r.surgery_date);
+    if (!pid || !date) { skipped++; continue; }
+    const opeNo = String(r.ope_no || "").trim() || (date + "-" + pid);
+    stmts.push(env.opecopy_db.prepare(
+      "INSERT INTO ope_schedule (ope_no, patient_no, surgery_date, kana, birth, sex, height, weight, " +
+      "dx_pre, dx_post, op_pre, op_post, surgeon, assistant, anes_min, ope_min, bleed, imported_at) " +
+      "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) " +
+      "ON CONFLICT(ope_no) DO UPDATE SET patient_no=excluded.patient_no, surgery_date=excluded.surgery_date, " +
+      "kana=excluded.kana, birth=excluded.birth, sex=excluded.sex, height=excluded.height, weight=excluded.weight, " +
+      "dx_pre=excluded.dx_pre, dx_post=excluded.dx_post, op_pre=excluded.op_pre, op_post=excluded.op_post, " +
+      "surgeon=excluded.surgeon, assistant=excluded.assistant, anes_min=excluded.anes_min, " +
+      "ope_min=excluded.ope_min, bleed=excluded.bleed, imported_at=excluded.imported_at"
+    ).bind(
+      opeNo, pid, date,
+      String(r.kana || "").trim(), schedDate(r.birth), String(r.sex || "").trim(),
+      String(r.height || "").trim(), String(r.weight || "").trim(),
+      String(r.dx_pre || "").trim(), String(r.dx_post || "").trim(),
+      String(r.op_pre || "").trim(), String(r.op_post || "").trim(),
+      String(r.surgeon || "").trim(), String(r.assistant || "").trim(),
+      String(r.anes_min || "").trim(), String(r.ope_min || "").trim(),
+      String(r.bleed || "").trim(), now
+    ));
+  }
+  if (!stmts.length) return jsonError("患者番号と手術日がそろった行がありません", 400);
+
+  // D1のbatchは件数が多いと重いので分けて流す
+  for (let i = 0; i < stmts.length; i += 50) {
+    await env.opecopy_db.batch(stmts.slice(i, i + 50));
+  }
+  return jsonOk({ saved: stmts.length, skipped: skipped });
+}
+
+async function apiScheduleStat(env) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const rs = await env.opecopy_db.prepare(
+    "SELECT substr(surgery_date,1,7) AS ym, COUNT(*) AS n FROM ope_schedule GROUP BY ym ORDER BY ym DESC LIMIT 24"
+  ).all();
+  const total = await env.opecopy_db.prepare("SELECT COUNT(*) AS n FROM ope_schedule").first();
+  return jsonOk({ months: (rs && rs.results) || [], total: (total && total.n) || 0 });
+}
+
+async function apiDeleteSchedule(env, body) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const ym = String((body && body.ym) || "").trim();
+  if (!/^\d{4}\/\d{2}$/.test(ym)) return jsonError("年月の形式が違います(例 2026/04)", 400);
+  await env.opecopy_db.prepare("DELETE FROM ope_schedule WHERE substr(surgery_date,1,7)=?").bind(ym).run();
+  return jsonOk({ deleted: true, ym: ym });
+}
+
+// 患者ID下6桁 + 手術日 で引く。同日に複数あれば全部返して選ばせる。
+async function apiFindSchedule(env, params) {
+  if (!env.opecopy_db) return jsonError("D1バインディング opecopy_db が設定されていません", 500);
+  const pid = schedPid(params.get("pid"));
+  const date = schedDate(params.get("date"));
+  if (!pid || !date) return jsonOk({ found: false, reason: "患者IDと手術日が必要です" });
+  const rs = await env.opecopy_db.prepare(
+    "SELECT * FROM ope_schedule WHERE patient_no=? AND surgery_date=? ORDER BY ope_no"
+  ).bind(pid, date).all();
+  const list = (rs && rs.results) || [];
+  if (!list.length) return jsonOk({ found: false });
+  return jsonOk({
+    found: true,
+    multiple: list.length > 1,
+    records: list.map((r) => ({
+      ope_no: r.ope_no, patient_no: r.patient_no, surgery_date: r.surgery_date,
+      kana: r.kana, birth: r.birth, sex: r.sex, height: r.height, weight: r.weight,
+      dx_pre: r.dx_pre, dx_post: r.dx_post, op_pre: r.op_pre, op_post: r.op_post,
+      surgeon: r.surgeon, assistant: r.assistant,
+      anes_min: r.anes_min, ope_min: r.ope_min, bleed: r.bleed,
+      kako_id: schedKakoId(r.patient_no),
+    })),
+  });
+}
+
+// ============================================================
 // 千葉大フォームの入力待ち一覧
 //   脊椎などの用紙には千葉大用の項目が入っているが、
 //   入力できるのはアカウントを持つ担当者だけなので、
@@ -3549,6 +3707,7 @@ const ADMIN_HTML = `<!DOCTYPE html>
       <button class="btn" id="btnRec">\uD83D\uDCD2 症例台帳</button>
       <button class="btn" id="btnKc">\uD83E\uDE7A 術式マスタ</button>
       <button class="btn" id="btnChiba">\uD83C\uDFEB 千葉大リスト</button>
+      <button class="btn" id="btnSched">\uD83D\uDCC4 手術記録表</button>
       <button class="btn" id="btnUsers">\uD83D\uDD11 利用者管理</button>
       <button class="btn" id="btnHomeReload">\uD83D\uDD04 再読込</button>
     </div>
@@ -3594,6 +3753,15 @@ const ADMIN_HTML = `<!DOCTYPE html>
           <input type="text" id="mId" class="w150" placeholder="tsarsa">
         </div>
       </div>
+      <div style="margin-top:10px">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:13.5px;cursor:pointer">
+          <input type="checkbox" id="mSticker">
+          <span>シール用紙あり（PDFの最終ページを最初から「シール面」にする）</span>
+        </label>
+        <div class="hint" style="margin-top:4px">
+          チェックを外すと、最初はすべて「記録面」になります。どちらの場合も、読み込んだあとに画面で変えられます。
+        </div>
+      </div>
       <div class="hint" id="mStat"></div>
     </div>
 
@@ -3628,6 +3796,29 @@ const ADMIN_HTML = `<!DOCTYPE html>
     <div class="mfoot">
       <button class="btn" id="impCancel">キャンセル</button>
       <button class="btn primary" id="impRun" disabled>取込む</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 手術記録表(CSV) ============ -->
+<div class="overlay hidden" id="scModal">
+  <div class="modal">
+    <div class="mhead">\uD83D\uDCC4 手術記録表の取り込み<small style="display:block;font-weight:400;color:#8a919c;font-size:12px;margin-top:3px">院内システムから出したCSVを月に1回取り込みます</small></div>
+    <div class="mbody">
+      <div id="scStat" class="empty">読込中…</div>
+      <div class="bar" style="margin-top:12px">
+        <input type="file" id="scFile" accept=".csv,.txt" style="display:none">
+        <button class="btn teal" id="scImport">\uD83D\uDCE5 CSVを取り込む</button>
+      </div>
+      <div class="hint" style="margin-top:10px">
+        手術伝票プラスで使っているCSVをそのまま選べます（文字コードは自動で判別します）。<br>
+        同じ手術番号の行は上書きされるので、月の途中で出し直したものを取り込み直しても重複しません。<br>
+        <b>取り込むのは氏名（カナ）だけです。</b>漢字氏名は取り込みません。
+      </div>
+      <div id="scPreview" class="hidden" style="margin-top:12px;border-top:1px solid var(--line);padding-top:12px"></div>
+    </div>
+    <div class="mfoot">
+      <button class="btn" id="scClose">閉じる</button>
     </div>
   </div>
 </div>
@@ -4073,6 +4264,10 @@ function showEdit(){
   $("editView").classList.remove("hidden");
   $("mName").value = cur.name || "";
   $("mId").value = cur.id || "";
+  // 未設定の古いマスタは、シール項目があるかどうかで判断する
+  $("mSticker").checked = (typeof cur.hasSticker === "boolean")
+    ? cur.hasSticker
+    : (cur.items || []).some(function(it){ return it.type === "sticker"; });
   renderItems();
   window.scrollTo(0,0);
 }
@@ -4300,7 +4495,7 @@ async function saveMaster(){
   try {
     var data = await api("/api/master", {
       method:"POST", headers:{"content-type":"application/json"},
-      body: JSON.stringify({ id: cur.id, name: cur.name, items: cur.items })
+      body: JSON.stringify({ id: cur.id, name: cur.name, hasSticker: $("mSticker").checked, items: cur.items })
     });
     cur = data.master;
     curIsNew = false;
@@ -4319,7 +4514,7 @@ async function saveMaster(){
 // JSONモーダル
 // ============================================================
 function openJson(){
-  var obj = { id: sanitizeId($("mId").value), name: $("mName").value.trim(), items: cur.items };
+  var obj = { id: sanitizeId($("mId").value), name: $("mName").value.trim(), hasSticker: $("mSticker").checked, items: cur.items };
   $("jsonArea").value = JSON.stringify(obj, null, 2);
   $("jsonModal").classList.remove("hidden");
 }
@@ -5011,6 +5206,211 @@ async function doLogout(){
 }
 
 // ============================================================
+// 手術記録表(CSV)の取り込み
+//   院内システムのCSVはShift_JIS(CP932)なので、文字コードを見て読み分ける。
+//   保存するのは読み取りに使う列だけで、氏名は姓名のカナのみ。
+// ============================================================
+var scPending = null;
+
+async function openSched(){
+  $("scModal").classList.remove("hidden");
+  scPending = null;
+  $("scPreview").classList.add("hidden");
+  await loadSchedStat();
+}
+
+async function loadSchedStat(){
+  $("scStat").innerHTML = "読込中…";
+  try {
+    var r = await api("/api/schedule");
+    var ms = r.months || [];
+    if (!ms.length){
+      $("scStat").innerHTML = '<b>まだ取り込まれていません</b>';
+      return;
+    }
+    var h = '<div style="margin-bottom:6px">登録済み <b>' + r.total + ' 件</b></div>' +
+            '<table class="list"><tr><th>年月</th><th>件数</th><th></th></tr>';
+    for (var i=0;i<ms.length;i++){
+      h += '<tr><td>' + esc(ms[i].ym) + '</td><td>' + esc(ms[i].n) + ' 件</td>' +
+           '<td><button class="btn mini danger" data-scdel="' + esc(ms[i].ym) + '">削除</button></td></tr>';
+    }
+    h += '</table>';
+    $("scStat").innerHTML = h;
+    var ds = $("scStat").querySelectorAll("button[data-scdel]");
+    for (var j=0;j<ds.length;j++){
+      ds[j].addEventListener("click", function(ev){ delSchedMonth(ev.currentTarget.getAttribute("data-scdel")); });
+    }
+  } catch(e){
+    $("scStat").innerHTML = '読み込みに失敗しました: ' + esc(e.message);
+  }
+}
+
+async function delSchedMonth(ym){
+  if (!confirm(ym + " の手術記録表を削除します。よろしい？")) return;
+  try {
+    await api("/api/schedule/delete", {
+      method:"POST", headers:{"content-type":"application/json"},
+      body: JSON.stringify({ ym: ym })
+    });
+    toast("削除しました");
+    await loadSchedStat();
+  } catch(e){ alert("失敗: " + e.message); }
+}
+
+// CSVを1行ずつに分ける（引用符の中の改行やカンマも扱う）
+function parseCsv(text){
+  var CSV_CR = String.fromCharCode(13), CSV_LF = String.fromCharCode(10);
+  var rows = [], row = [], cur = "", q = false;
+  for (var i=0;i<text.length;i++){
+    var c = text.charAt(i);
+    if (q){
+      if (c === '"'){
+        if (text.charAt(i+1) === '"'){ cur += '"'; i++; }
+        else q = false;
+      } else cur += c;
+    } else {
+      if (c === '"') q = true;
+      else if (c === ","){ row.push(cur); cur = ""; }
+      else if (c === CSV_CR){ /* 無視 */ }
+      else if (c === CSV_LF){ row.push(cur); rows.push(row); row = []; cur = ""; }
+      else cur += c;
+    }
+  }
+  if (cur !== "" || row.length){ row.push(cur); rows.push(row); }
+  return rows;
+}
+
+// Shift_JIS(CP932)かUTF-8かを判定して読む
+async function readCsvText(file){
+  var buf = await file.arrayBuffer();
+  var utf8 = new TextDecoder("utf-8", { fatal:false }).decode(buf);
+  // UTF-8として読んで置換文字(U+FFFD)が多ければCP932とみなす
+  var bad = (utf8.match(/\uFFFD/g) || []).length;
+  if (bad > 3){
+    try { return new TextDecoder("shift_jis").decode(buf); } catch(e){}
+    try { return new TextDecoder("windows-31j").decode(buf); } catch(e){}
+  }
+  return utf8;
+}
+
+// 「1:手術番号」のような見出しから列の位置を探す
+function csvColIndex(head, name){
+  for (var i=0;i<head.length;i++){
+    var h = String(head[i] || "");
+    var p = h.indexOf(":");
+    if (p >= 0) h = h.slice(p+1);
+    if (h.trim() === name) return i;
+  }
+  return -1;
+}
+
+// 「9:12」と「9:58」から「0:46」
+function minutesBetween(a, b){
+  var p = function(t){
+    var m = String(t || "").trim().match(new RegExp("^([0-9]{1,2})[:：]([0-9]{1,2})$"));
+    return m ? Number(m[1])*60 + Number(m[2]) : null;
+  };
+  var s = p(a), e = p(b);
+  if (s === null || e === null) return "";
+  var d = e - s;
+  if (d < 0) d += 24*60;
+  return Math.floor(d/60) + ":" + ("0" + (d%60)).slice(-2);
+}
+
+async function onScFile(ev){
+  var f = ev.currentTarget.files && ev.currentTarget.files[0];
+  ev.currentTarget.value = "";
+  if (!f) return;
+  try {
+    var text = await readCsvText(f);
+    var rows = parseCsv(text);
+    if (rows.length < 2){ alert("中身が読み取れませんでした"); return; }
+    var head = rows[0];
+    var C = {};
+    var need = ["手術番号","患者番号","手術日","氏名（カナ）","生年月日","性別","身長","体重",
+                "術前病名","術後病名","術前術式","術後術式","執刀医","副医師",
+                "麻酔時間","執刀開始時刻","執刀終了時刻","出血量"];
+    for (var n=0;n<need.length;n++) C[need[n]] = csvColIndex(head, need[n]);
+    if (C["患者番号"] < 0 || C["手術日"] < 0){
+      alert("「患者番号」と「手術日」の列が見つかりません。手術予定のCSVか確認してください。");
+      return;
+    }
+    var get = function(r, name){ var i = C[name]; return (i >= 0 && r[i] != null) ? String(r[i]).trim() : ""; };
+    var out = [], skipped = 0, noKana = 0;
+    for (var i=1;i<rows.length;i++){
+      var r = rows[i];
+      if (!r || !r.length) continue;
+      var pid = get(r,"患者番号"), date = get(r,"手術日");
+      if (!pid || !date){ skipped++; continue; }
+      var kana = get(r,"氏名（カナ）");
+      if (!kana) noKana++;
+      out.push({
+        ope_no: get(r,"手術番号"), patient_no: pid, surgery_date: date,
+        kana: kana, birth: get(r,"生年月日"), sex: get(r,"性別"),
+        height: get(r,"身長"), weight: get(r,"体重"),
+        dx_pre: get(r,"術前病名"), dx_post: get(r,"術後病名"),
+        op_pre: get(r,"術前術式"), op_post: get(r,"術後術式"),
+        surgeon: get(r,"執刀医"), assistant: get(r,"副医師"),
+        anes_min: get(r,"麻酔時間"),
+        ope_min: minutesBetween(get(r,"執刀開始時刻"), get(r,"執刀終了時刻")),
+        bleed: get(r,"出血量"),
+      });
+    }
+    if (!out.length){ alert("取り込める行がありませんでした"); return; }
+    scPending = out;
+    var months = {};
+    for (var m2=0;m2<out.length;m2++){
+      var ym = out[m2].surgery_date.replace(new RegExp("[.-]", "g"), "/").slice(0,7);
+      months[ym] = (months[ym]||0)+1;
+    }
+    var mList = Object.keys(months).sort().map(function(k){ return k + " " + months[k] + "件"; }).join(" ／ ");
+    var h = '<div style="font-weight:700;margin-bottom:6px">取込内容の確認</div>' +
+      '<div><b>' + out.length + ' 件</b>を取り込みます（' + esc(mList) + '）</div>';
+    if (skipped) h += '<div style="color:#8a919c;font-size:13px;margin-top:4px">※ ' + skipped + ' 行は患者番号か手術日が空のため取り込みません</div>';
+    if (noKana)  h += '<div style="color:#c9821a;font-size:13px;margin-top:4px">※ ' + noKana + ' 件は氏名（カナ）が空でした</div>';
+    h += '<div style="font-size:12.5px;color:#8a919c;margin-top:6px">先頭: ' +
+         esc(out[0].surgery_date + " / " + out[0].patient_no + " / " + (out[0].kana || "-") + " / " + (out[0].op_post || "")) + '</div>' +
+      '<div class="bar" style="margin-top:10px">' +
+      '<button class="btn primary" id="scCommit">この内容で取り込む</button>' +
+      '<button class="btn" id="scCancel">やめる</button></div>';
+    $("scPreview").innerHTML = h;
+    $("scPreview").classList.remove("hidden");
+    $("scCommit").addEventListener("click", commitSched);
+    $("scCancel").addEventListener("click", function(){
+      scPending = null; $("scPreview").classList.add("hidden");
+    });
+  } catch(e){
+    alert("読み込みに失敗: " + e.message);
+  }
+}
+
+async function commitSched(){
+  if (!scPending) return;
+  var btn = $("scCommit");
+  btn.disabled = true;
+  try {
+    // 件数が多いので分けて送る
+    var total = 0;
+    for (var i=0;i<scPending.length;i+=100){
+      btn.textContent = "取り込み中 " + Math.min(i+100, scPending.length) + "/" + scPending.length;
+      var r = await api("/api/schedule", {
+        method:"POST", headers:{"content-type":"application/json"},
+        body: JSON.stringify({ rows: scPending.slice(i, i+100) })
+      });
+      total += (r.saved || 0);
+    }
+    toast(total + " 件を取り込みました");
+    scPending = null;
+    $("scPreview").classList.add("hidden");
+    await loadSchedStat();
+  } catch(e){
+    alert("取り込みに失敗: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "この内容で取り込む";
+  }
+}
+
+// ============================================================
 // 千葉大リスト (病名 / 術式) — KV保存。Excelの往復で入れ替える
 // ============================================================
 var chKind = "byomei";      // 今見ている種別
@@ -5550,12 +5950,13 @@ function renderRecords(){
     return;
   }
   var h = '<table class="list"><tr>' +
-    '<th>ID</th><th>患者ID</th><th>手術日</th><th>用紙</th><th>状態</th><th>読取日時</th><th>読取者</th><th></th></tr>';
+    '<th>ID</th><th>患者ID</th><th>氏名（カナ）</th><th>手術日</th><th>用紙</th><th>状態</th><th>読取日時</th><th>読取者</th><th></th></tr>';
   for (var i=0;i<recRows.length;i++){
     var r = recRows[i];
     h += '<tr data-rec="' + esc(r.id) + '" style="cursor:pointer">' +
       '<td>' + esc(r.id) + '</td>' +
       '<td>' + esc(r.patient_no || "") + '</td>' +
+      '<td>' + esc(r.kana || "") + '</td>' +
       '<td>' + esc(r.surgery_date || "") + '</td>' +
       '<td>' + esc(r.master_name || r.master_id || "") + '</td>' +
       '<td>' + esc(r.status || "") + '</td>' +
@@ -5658,7 +6059,7 @@ async function exportRecordsCsv(){
   btn.disabled = true;
   var oldLabel = btn.textContent;
   try {
-    var fixedCols = ["id","患者ID","手術日","用紙","状態","読取日時","読取者"];
+    var fixedCols = ["id","患者ID","氏名（カナ）","手術日","用紙","状態","読取日時","読取者"];
     var labels = [];          // 動的な項目名(出現順)
     var seen = {};
     var rowsOut = [];
@@ -5676,7 +6077,7 @@ async function exportRecordsCsv(){
         map[lb] = fs[f].value;
       }
       rowsOut.push({ base: [
-        rec.id, rec.patient_no || "", rec.surgery_date || "",
+        rec.id, rec.patient_no || "", rec.kana || "", rec.surgery_date || "",
         rec.master_name || rec.master_id || "", rec.status || "",
         recFmt(rec.created_at), rec.created_by || ""
       ], map: map });
@@ -5733,6 +6134,13 @@ $("btnRec").addEventListener("click", openRecords);
 $("btnUsers").addEventListener("click", openUsers);
 $("btnKc").addEventListener("click", openKcodes);
 $("btnChiba").addEventListener("click", openChiba);
+$("btnSched").addEventListener("click", openSched);
+$("scClose").addEventListener("click", function(){ $("scModal").classList.add("hidden"); });
+$("scImport").addEventListener("click", function(){ $("scFile").click(); });
+$("scFile").addEventListener("change", onScFile);
+$("scModal").addEventListener("click", function(ev){
+  if (ev.target === $("scModal")) $("scModal").classList.add("hidden");
+});
 $("chClose").addEventListener("click", function(){ $("chModal").classList.add("hidden"); });
 $("chTabB").addEventListener("click", function(){ chSetTab("byomei"); });
 $("chTabJ").addEventListener("click", function(){ chSetTab("jutsushiki"); });
@@ -6171,6 +6579,7 @@ const FRONT_HTML = `<!DOCTYPE html>
       各ページの役割を選んでね。<b>「送らない」にしたページはAIに送信されません</b>（個人情報の載る面を外せます）。
     </div>
     <div id="dupNote" style="display:none;margin-top:8px;padding:9px 12px;border:1px solid #e8c98d;background:#fffaf2;border-radius:9px;font-size:12.5px;line-height:1.6"></div>
+    <div id="csvNote" style="display:none;margin-top:8px;padding:9px 12px;border:1px solid #bcdcd3;background:#f2faf7;border-radius:9px;font-size:12.5px;line-height:1.7"></div>
     <div class="thumbs" id="thumbs"></div>
   </div>
 
@@ -6298,6 +6707,11 @@ var pages = [];           // {pdfPage|img, role:"rec"|"mat"|"skip", num}
 var pdfDoc = null;
 var currentRecordId = null;   // 保存中の台帳レコードid(新規読み取りで null に戻す)
 var currentFileHash = "";     // 読み込んだPDFの指紋。同じファイルなら台帳の同じ行を使い回す
+var schedRec = null;          // 手術予定CSVから引いた1件（見つからなければ null）
+var fileKeys = { date:"", pid:"" };   // ファイル名から取り出した手術日と患者ID(下6桁)
+var roleTouched = false;              // ページの役割を手で変えたか(変えていれば既定で上書きしない)
+var schedCand = [];           // 同じ患者・同じ日が複数あったときの候補
+var csvFilled = {};           // CSVから入れた項目 no -> true（画面にバッジを出す）
 var results = {};         // no -> 値
 var labels = [];          // 確定した材料シール
 var labelObs = [];        // 各タイルからの生の観測(多数決の材料)
@@ -6660,20 +7074,48 @@ function onMasterChange(){
     }
   }
   $("masterInfo").textContent = info;
+  // 用紙を選び直したら、まだ手で変えていないページの既定を付け直す
+  if (pages.length && !roleTouched){
+    for (var k=0;k<pages.length;k++) pages[k].role = defaultRole(pages[k].num, pages.length);
+    renderThumbs();
+  }
   updateRunBtn();
 }
 
 // ============================================================
 // STEP2 ページ読込・役割選択
 // ============================================================
+// 選んでいる用紙が「シール用紙あり」なら最終ページをシール面にする。
+// 「なし」ならすべて記録面。もちろん読み込んだあとに手で変えられる。
+function masterHasSticker(){
+  var id = $("masterSel").value;
+  for (var i=0;i<masters.length;i++){
+    if (masters[i].id !== id) continue;
+    if (typeof masters[i].hasSticker === "boolean") return masters[i].hasSticker;
+    break;
+  }
+  return true;   // 設定が無い古いマスタは、これまでどおり最終ページをシール面にする
+}
+
+function defaultRole(pageNo, total){
+  // 1ページしかないPDFは記録面にする(全部がシール面だと読み取る中身が無くなるため)
+  if (total > 1 && pageNo === total && masterHasSticker()) return "mat";
+  return "rec";
+}
+
 async function onFile(){
   var f = $("pdfFile").files[0];
   if (!f) return;
   $("thumbs").innerHTML = '<div class="prog"><span class="spin"></span> 読込中…</div>';
   pages = []; pdfDoc = null;
   currentFileHash = ""; currentRecordId = null;
+  schedRec = null; schedCand = []; csvFilled = {};
+  roleTouched = false;
   var dn = document.getElementById("dupNote");
   if (dn){ dn.style.display = "none"; dn.textContent = ""; }
+  var cn = document.getElementById("csvNote");
+  if (cn){ cn.style.display = "none"; cn.innerHTML = ""; }
+  await lookupSchedule(f.name);   // ファイル名から手術予定CSVを引く
   try {
     if (f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf")){
       await ensurePdfJs();
@@ -6684,7 +7126,7 @@ async function onFile(){
       pdfDoc = await window.pdfjsLib.getDocument({ data: buf }).promise;
       for (var i=1;i<=pdfDoc.numPages;i++){
         var pg = await pdfDoc.getPage(i);
-        pages.push({ pdfPage: pg, num: i, role: (i === pdfDoc.numPages ? "mat" : "rec") });
+        pages.push({ pdfPage: pg, num: i, role: defaultRole(i, pdfDoc.numPages) });
       }
     } else {
       var abuf = await f.arrayBuffer();
@@ -6798,6 +7240,7 @@ async function renderThumbs(){
       var el = ev.currentTarget;
       var idx = parseInt(el.getAttribute("data-i"),10);
       pages[idx].role = el.getAttribute("data-r");
+      roleTouched = true;          // 手で変えたので、用紙を選び直しても上書きしない
       syncRoleButtons();
       updateRunBtn();
     });
@@ -6879,12 +7322,17 @@ function bumpPatientId(v){
 // (時間と同じく、画面・コピー・台帳がすべて同じ値になる)
 function normalizeBumpFields(){
   var items = (curMaster && curMaster.items) || [];
+  var base = resolvePatientNo();     // 加工前の患者番号
   for (var i = 0; i < items.length; i++){
     var it = items[i];
     if (!isSaveBump(it.label || "")) continue;
     var key = String(it.no);
-    if (results[key] == null || results[key] === "") continue;
-    results[key] = bumpPatientId(results[key]);
+    if (base){
+      // 患者番号が分かっているときは、そこから作る（読み取った値は使わない）
+      results[key] = bumpPatientId(base);
+    }
+    // 患者番号が分からないときは、用紙に書かれた加工IDをそのまま残す
+    // （用紙の「加工ID」欄は既に+1された値なので、ここで足すと二重になる）
   }
 }
 
@@ -6935,12 +7383,60 @@ function buildRecordPayload(){
 }
 
 function pickPatientNo(){
+  return resolvePatientNo();   // 加工前の患者番号（加工IDの値は拾わない）
+}
+
+// 半角カナ・半角英数を全角にそろえる（院内システムから半角で来ることがある）
+function toWideKana(v){
+  var s = String(v == null ? "" : v).trim();
+  if (s === "") return "";
+  var pair = {
+    "\uFF76\uFF9E":"ガ","\uFF77\uFF9E":"ギ","\uFF78\uFF9E":"グ","\uFF79\uFF9E":"ゲ","\uFF7A\uFF9E":"ゴ",
+    "\uFF7B\uFF9E":"ザ","\uFF7C\uFF9E":"ジ","\uFF7D\uFF9E":"ズ","\uFF7E\uFF9E":"ゼ","\uFF7F\uFF9E":"ゾ",
+    "\uFF80\uFF9E":"ダ","\uFF81\uFF9E":"ヂ","\uFF82\uFF9E":"ヅ","\uFF83\uFF9E":"デ","\uFF84\uFF9E":"ド",
+    "\uFF8A\uFF9E":"バ","\uFF8B\uFF9E":"ビ","\uFF8C\uFF9E":"ブ","\uFF8D\uFF9E":"ベ","\uFF8E\uFF9E":"ボ",
+    "\uFF8A\uFF9F":"パ","\uFF8B\uFF9F":"ピ","\uFF8C\uFF9F":"プ","\uFF8D\uFF9F":"ペ","\uFF8E\uFF9F":"ポ",
+    "\uFF73\uFF9E":"ヴ"
+  };
+  var single = {
+    "\uFF71":"ア","\uFF72":"イ","\uFF73":"ウ","\uFF74":"エ","\uFF75":"オ",
+    "\uFF76":"カ","\uFF77":"キ","\uFF78":"ク","\uFF79":"ケ","\uFF7A":"コ",
+    "\uFF7B":"サ","\uFF7C":"シ","\uFF7D":"ス","\uFF7E":"セ","\uFF7F":"ソ",
+    "\uFF80":"タ","\uFF81":"チ","\uFF82":"ツ","\uFF83":"テ","\uFF84":"ト",
+    "\uFF85":"ナ","\uFF86":"ニ","\uFF87":"ヌ","\uFF88":"ネ","\uFF89":"ノ",
+    "\uFF8A":"ハ","\uFF8B":"ヒ","\uFF8C":"フ","\uFF8D":"ヘ","\uFF8E":"ホ",
+    "\uFF8F":"マ","\uFF90":"ミ","\uFF91":"ム","\uFF92":"メ","\uFF93":"モ",
+    "\uFF94":"ヤ","\uFF95":"ユ","\uFF96":"ヨ",
+    "\uFF97":"ラ","\uFF98":"リ","\uFF99":"ル","\uFF9A":"レ","\uFF9B":"ロ",
+    "\uFF9C":"ワ","\uFF66":"ヲ","\uFF9D":"ン",
+    "\uFF67":"ァ","\uFF68":"ィ","\uFF69":"ゥ","\uFF6A":"ェ","\uFF6B":"ォ",
+    "\uFF6C":"ャ","\uFF6D":"ュ","\uFF6E":"ョ","\uFF6F":"ッ",
+    "\uFF9E":"゛","\uFF9F":"゜","\uFF61":"。","\uFF64":"、","\uFF62":"「","\uFF63":"」",
+    "\uFF65":"・","\uFF70":"ー"
+  };
+  var out = "";
+  for (var i=0;i<s.length;i++){
+    var two = s.substr(i,2);
+    if (pair[two]){ out += pair[two]; i++; continue; }
+    var one = s.charAt(i);
+    if (single[one]){ out += single[one]; continue; }
+    var code = one.charCodeAt(0);
+    if (code === 0x20){ out += "\u3000"; continue; }
+    if (code >= 0x21 && code <= 0x7E){ out += String.fromCharCode(code + 0xFEE0); continue; }
+    out += one;
+  }
+  return out;
+}
+
+// 患者姓（カタカナ）。手術記録表があればそれを、無ければ読み取った値を使う。
+function pickKana(){
+  if (schedRec && schedRec.kana) return toWideKana(schedRec.kana);
   var items = (curMaster && curMaster.items) || [];
   for (var i = 0; i < items.length; i++){
-    if (isSavePatientId(items[i].label || "")){
-      var v = results[String(items[i].no)];
-      return (v == null ? "" : String(v).trim());   // B列は読んだままの値
-    }
+    var lb = String(items[i].label || "");
+    if (lb.indexOf("カタカナ") < 0 && lb.indexOf("カナ") < 0) continue;
+    var v = results[String(items[i].no)];
+    if (v != null && String(v).trim() !== "") return toWideKana(v);
   }
   return "";
 }
@@ -6974,6 +7470,7 @@ async function doSaveRecord(){
         master_id: (curMaster.id || ""),
         master_name: (curMaster.name || ""),
         patient_no: pickPatientNo(),
+        kana: pickKana(),
         surgery_date: pickSurgeryDate(),
         status: "draft",
         payload: buildRecordPayload()
@@ -7006,6 +7503,7 @@ async function run(){
   icdPicked = {};
   currentRecordId = null;
   currentFileHash = "";
+  schedRec = null; schedCand = []; csvFilled = {};
   $("resultArea").innerHTML = '<div class="card prog"><span class="spin"></span> <span id="progMsg">準備中…</span></div>';
 
   try {
@@ -7051,6 +7549,9 @@ async function run(){
       curMaster = ex.master;
       normalizeDurationFields();   // 手術時間・麻酔時間を 1:33 の形にそろえる
       normalizeBumpFields();       // 加工IDを +1 して下6桁にそろえる
+      // ファイル名で引けていなければ、読み取った患者ID・手術日で引き直す
+      if (!schedRec && !schedCand.length) await lookupScheduleFromResults();
+      applySchedule();             // 手術記録表の値をかぶせる（CSV優先）
       disagree = ex.disagree || {};
       snapped = ex.snapped || {};
       doctorInfo = ex.doctorInfo || null;
@@ -7388,10 +7889,12 @@ function fieldRow(it, idx){
     ctrl += '<div style="margin-top:5px"><button class="btn mini" data-dc="' + esc(no) + '">\uD83D\uDC68‍⚕️ 医師マスタから選ぶ</button></div>';
   }
   // 候補リストが未設定でも、病名・診断名の項目なら候補ボタンを出す
+  // 病名候補は、マスタで「病名(ICD-10)」を選んだ項目にだけ出す。
+  // 「手術診断名」のように候補が要らない項目にも出てしまうため、自動表示はしない。
   var wantIcd = (it.suggest === "icd10");
-  if (!wantIcd && !it.suggest && (it.type === "ocr" || it.type === "choice")){
-    var lb = String(it.label || "");
-    if (lb.indexOf("病名") >= 0 || lb.indexOf("診断名") >= 0) wantIcd = true;
+  if (csvFilled[String(no)]){
+    ctrl += '<div style="margin-top:4px"><span style="font-size:11px;color:#1d7d76;background:#e6f4f0;' +
+            'border:1px solid #bcdcd3;border-radius:4px;padding:1px 6px">\uD83D\uDCC4 手術記録表から</span></div>';
   }
   if (it.suggest === "chiba-byomei" || it.suggest === "chiba-jutsushiki"){
     ctrl += '<div style="margin-top:5px"><button class="btn mini" data-cb="' + esc(no) + '" data-kind="' +
@@ -7773,6 +8276,7 @@ function resetAll(){
   icdPicked = {};
   currentRecordId = null;
   currentFileHash = "";
+  schedRec = null; schedCand = []; csvFilled = {};
   pages = []; pdfDoc = null;
   $("pdfFile").value = "";
   $("thumbs").innerHTML = "";
@@ -8003,6 +8507,208 @@ async function ensureQrGate(){
 $("qrRenew").addEventListener("click", startQrGate);
 
 // ============================================================
+// 手術予定CSVとの照合
+//   PDFセパレーターの出力ファイル名（接頭語_手術日8桁_患者ID6桁_患者名.pdf）から
+//   手術日と患者IDを取り出して照合する。
+//   OCRを待たずに済み、患者IDの読み違いで別患者に紐づく事故も起きない。
+// ============================================================
+
+// ファイル名から 手術日(YYYY/MM/DD) と 患者ID(下6桁) を取り出す
+function keysFromFileName(name){
+  var s = String(name || "");
+  s = s.replace(new RegExp("[.][A-Za-z0-9]+$"), "");   // 拡張子を落とす
+  var parts = s.split("_");
+  var date = "", pid = "";
+  for (var i=0;i<parts.length;i++){
+    var p = parts[i].trim();
+    if (!date && /^[0-9]{8}$/.test(p)){
+      date = p.slice(0,4) + "/" + p.slice(4,6) + "/" + p.slice(6,8);
+      continue;
+    }
+    if (date && !pid && /^[0-9]{4,10}$/.test(p)){    // 手術日の次に来る数字が患者ID
+      pid = p.length > 6 ? p.slice(-6) : p;
+    }
+  }
+  return { date: date, pid: pid };
+}
+
+// ファイル名で引けなかったときに、読み取った値から引き直す
+async function lookupScheduleFromResults(){
+  var items = (curMaster && curMaster.items) || [];
+  var pid = "", date = "";
+  for (var i=0;i<items.length;i++){
+    var lb = String(items[i].label || "");
+    var v = results[String(items[i].no)];
+    if (v == null || String(v).trim() === "") continue;
+    if (!pid && (lb.indexOf("患者ID") >= 0 || lb.indexOf("患者番号") >= 0 || lb.indexOf("加工ID") >= 0)){
+      var raw = String(v).replace(/[^0-9]/g, "");
+      if (raw){
+        // 加工IDは+1されているので元に戻してから引く
+        if (lb.indexOf("加工ID") >= 0) raw = String(Number(raw) - 1);
+        pid = raw.length > 6 ? raw.slice(-6) : raw;
+      }
+    }
+    if (!date && (lb.indexOf("手術日") >= 0 || lb.indexOf("実施日") >= 0)){
+      var t = String(v).trim().replace(new RegExp("[.-]", "g"), "/");
+      if (new RegExp("^[0-9]{4}/[0-9]{1,2}/[0-9]{1,2}").test(t)) date = t;
+    }
+  }
+  if (pid && date) await fetchSchedule(pid, date, "読み取り結果");
+}
+
+async function lookupSchedule(fileName){
+  var k = keysFromFileName(fileName);
+  fileKeys = k;                                     // 照合できなくても患者IDの根拠として使う
+  if (!k.date || !k.pid) return;                    // 規則どおりの名前でなければ後でOCR結果から引く
+  await fetchSchedule(k.pid, k.date, "ファイル名");
+}
+
+// 本当の患者番号(加工前)を決める。確かな順に、手術記録表 → ファイル名 → 読み取り結果。
+function resolvePatientNo(){
+  if (schedRec && schedRec.patient_no) return String(schedRec.patient_no);
+  if (fileKeys && fileKeys.pid) return String(fileKeys.pid);
+  var items = (curMaster && curMaster.items) || [];
+  for (var i=0;i<items.length;i++){
+    var lb = String(items[i].label || "");
+    if (lb.indexOf("加工") >= 0) continue;          // 「加工ID」は加工後の値なので使わない
+    if (!isSavePatientId(lb)) continue;
+    var v = results[String(items[i].no)];
+    if (v != null && String(v).trim() !== "") return String(v).trim();
+  }
+  return "";
+}
+
+async function fetchSchedule(pid, date, how){
+  try {
+    var r = await api("/api/schedule/find?pid=" + encodeURIComponent(pid) +
+                      "&date=" + encodeURIComponent(date));
+    if (!r || !r.found) { showCsvNote(null, how, pid, date); return; }
+    schedCand = r.records || [];
+    if (schedCand.length > 1){
+      schedRec = null;
+      showCsvPicker(how);
+    } else {
+      schedRec = schedCand[0];
+      showCsvNote(schedRec, how, pid, date);
+    }
+  } catch(e){
+    // 照合に失敗しても読み取りは続けられる
+  }
+}
+
+function showCsvNote(rec, how, pid, date){
+  var box = document.getElementById("csvNote");
+  if (!box) return;
+  if (!rec){
+    box.innerHTML = '<b>\uD83D\uDCC4 手術記録表に該当がありません</b>（' + esc(how) + 'から 患者ID ' +
+      esc(pid || "-") + ' / ' + esc(date || "-") + ' で照合）。用紙から読み取った値をお使いください。';
+    box.style.display = "block";
+    return;
+  }
+  box.innerHTML = '<b>\uD83D\uDCC4 手術記録表と照合できました</b>（' + esc(how) + 'で一致）<br>' +
+    esc(toWideKana(rec.kana) || "(氏名なし)") + '　' + esc(rec.surgery_date) + '　患者ID ' + esc(rec.patient_no) +
+    '　' + esc(rec.sex || "") + '　' + esc(rec.birth || "") + '<br>' +
+    '<span style="color:#8a919c">' + esc(rec.op_post || rec.op_pre || "") + '</span>';
+  box.style.display = "block";
+}
+
+function showCsvPicker(how){
+  var box = document.getElementById("csvNote");
+  if (!box) return;
+  var h = '<b>\uD83D\uDCC4 同じ日に手術が ' + schedCand.length + ' 件あります</b>（' + esc(how) + 'で照合）。どれか選んでください。<br>';
+  for (var i=0;i<schedCand.length;i++){
+    var c = schedCand[i];
+    h += '<button class="btn mini" data-csvpick="' + i + '" style="margin:5px 5px 0 0">' +
+         esc(c.op_post || c.op_pre || ("手術" + (i+1))) + '</button>';
+  }
+  box.innerHTML = h;
+  box.style.display = "block";
+  var bs = box.querySelectorAll("button[data-csvpick]");
+  for (var j=0;j<bs.length;j++){
+    bs[j].addEventListener("click", function(ev){
+      schedRec = schedCand[Number(ev.currentTarget.getAttribute("data-csvpick"))];
+      showCsvNote(schedRec, "選択", schedRec.patient_no, schedRec.surgery_date);
+      applySchedule();
+      renderResults();
+      toast("手術記録表の内容を反映しました");
+    });
+  }
+}
+
+// ▼▼ 手術記録表のどの値をどの項目に入れるか ▼▼
+//   項目名に下の語が含まれていれば、その値で置き換える。
+//   用紙のマスタに合わせて足し引きしてください。
+var CSV_MAP = [
+  { keys: ["患者姓", "氏名", "患者名"],        get: function(r){ return toWideKana(r.kana); } },
+  { keys: ["生年月日"],                        get: function(r){ return r.birth; } },
+  { keys: ["性別"],                            get: function(r){ return csvSex(r.sex); } },
+  { keys: ["手術日", "手術年月日", "実施日"],  get: function(r){ return r.surgery_date; } },
+  { keys: ["加工ID"],                          get: function(r){ return r.kako_id; } },
+  { keys: ["身長"],                            get: function(r){ return r.height; } },
+  { keys: ["体重"],                            get: function(r){ return r.weight; } },
+  { keys: ["手術時間"],                        get: function(r){ return r.ope_min; } },
+  { keys: ["麻酔時間"],                        get: function(r){ return r.anes_min; } },
+  { keys: ["出血量"],                          get: function(r){ return r.bleed; } },
+  { keys: ["術者", "執刀"],                    get: function(r){ return r.surgeon; } },
+  { keys: ["助手"],                            get: function(r){ return r.assistant; } },
+];
+// ▲▲ ここまで ▲▲
+
+// CSVは「男」「女」、JOANRは「男性」「女性」
+function csvSex(v){
+  var s = String(v == null ? "" : v).trim();
+  if (s === "男") return "男性";
+  if (s === "女") return "女性";
+  return s;
+}
+
+function findItemByNo(no){
+  var items = (curMaster && curMaster.items) || [];
+  for (var i=0;i<items.length;i++){ if (String(items[i].no) === String(no)) return items[i]; }
+  return {};
+}
+
+function csvHit(label, keys){
+  var s = String(label == null ? "" : label);
+  for (var i=0;i<keys.length;i++){ if (s.indexOf(keys[i]) >= 0) return true; }
+  return false;
+}
+
+// 読み取り結果に手術記録表の値をかぶせる（CSV優先）
+function applySchedule(){
+  csvFilled = {};
+  if (!schedRec || !curMaster) return;
+  var items = curMaster.items || [];
+  for (var i=0;i<items.length;i++){
+    var it = items[i];
+    if (it.type === "sticker" || it.type === "fixed") continue;
+    if (isChibaSec(it.section)) continue;      // 千葉大用はJOANR項目から写す仕組みに任せる
+    var label = String(it.label || "");
+    for (var m=0;m<CSV_MAP.length;m++){
+      if (!csvHit(label, CSV_MAP[m].keys)) continue;
+      var v = CSV_MAP[m].get(schedRec);
+      if (v == null || String(v).trim() === "") break;
+      results[String(it.no)] = String(v).trim();
+      csvFilled[String(it.no)] = true;
+      break;
+    }
+  }
+}
+
+// 候補検索に使う言葉（病名・術式はCSVの表記の方が確かなので優先して渡す）
+function csvSuggestQuery(it, fallback){
+  if (!schedRec) return fallback;
+  var label = String(it.label || "");
+  if (label.indexOf("病名") >= 0 || label.indexOf("診断名") >= 0){
+    return schedRec.dx_post || schedRec.dx_pre || fallback;
+  }
+  if (label.indexOf("術式") >= 0){
+    return schedRec.op_post || schedRec.op_pre || fallback;
+  }
+  return fallback;
+}
+
+// ============================================================
 // 千葉大リストの候補
 //   登録できる語が決まっているので、その一覧から近いものを選ばせる。
 //   リストに無い語は返らない作りになっている。
@@ -8013,7 +8719,8 @@ var cbKind = "byomei";
 function openChibaPick(no, kind){
   cbTargetNo = no;
   cbKind = (kind === "jutsushiki") ? "jutsushiki" : "byomei";
-  $("cbQuery").value = results[no] == null ? "" : String(results[no]);
+  var it1 = findItemByNo(no);
+  $("cbQuery").value = csvSuggestQuery(it1, results[no] == null ? "" : String(results[no]));
   $("cbList").innerHTML = "";
   $("cbModal").classList.remove("hidden");
   runChibaPick();
@@ -8060,7 +8767,8 @@ var icTargetNo = null;
 
 function openIcd(no){
   icTargetNo = no;
-  $("icQuery").value = results[no] == null ? "" : String(results[no]);
+  var it0 = findItemByNo(no);
+  $("icQuery").value = csvSuggestQuery(it0, results[no] == null ? "" : String(results[no]));
   $("icList").innerHTML = "";
   $("icModal").classList.remove("hidden");
   runIcd();
