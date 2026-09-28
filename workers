@@ -8525,7 +8525,7 @@ function keysFromFileName(name){
       date = p.slice(0,4) + "/" + p.slice(4,6) + "/" + p.slice(6,8);
       continue;
     }
-    if (date && !pid && /^[0-9]{4,10}$/.test(p)){    // 手術日の次に来る数字が患者ID
+    if (date && !pid && /^[0-9]{4,10}$/.test(p)){    // 手術日の次に来る数字が患者IDあ
       pid = p.length > 6 ? p.slice(-6) : p;
     }
   }
